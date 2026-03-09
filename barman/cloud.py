@@ -199,6 +199,10 @@ class CloudTarUploader(object):
         :param str|None staging_dir: the temporary directory where part files are
           created before uploaded
         """
+        if not isinstance(chunk_size, int) or chunk_size <= 0:
+            raise ValueError(
+                "chunk_size must be a positive integer, got: %s" % chunk_size
+            )
         self.cloud_interface = cloud_interface
         self.key = key
         self.chunk_size = chunk_size
@@ -289,11 +293,6 @@ class CloudTarUploader(object):
         if not data:
             return
 
-        if not self.chunk_size or self.chunk_size <= 0:
-            raise ValueError(
-                "chunk_size must be a positive integer, got: %s" % self.chunk_size
-            )
-
         offset = 0
         data_len = len(data)
         while offset < data_len:
@@ -307,39 +306,52 @@ class CloudTarUploader(object):
             if self.buffer.tell() == self.chunk_size:
                 self._upload_part_buffer()
 
-    def _upload_part_buffer(self):
+    def _upload_part_buffer(self, is_final=False):
         """
         Upload the current part buffer as one multipart upload part.
         """
         if not self.buffer or self.buffer.tell() == 0:
             return
 
+        part_size = self.buffer.tell()
+        if not is_final and part_size != self.chunk_size:
+            raise RuntimeError(
+                "Cannot upload non-final multipart part with size %s (expected %s)"
+                % (part_size, self.chunk_size)
+            )
+
         if not self.upload_metadata:
             self.upload_metadata = self.cloud_interface.create_multipart_upload(
                 self.key
             )
 
-        part_size = self.buffer.tell()
         self.buffer.flush()
         self.buffer.seek(0, os.SEEK_SET)
-        self.counter += 1
+        part_number = self.counter + 1
         if self.max_bandwidth:
             # Upload throttling is applied just before uploading the next part so that
             # compression and flushing have already happened before we start waiting.
             self._throttle_upload(part_size)
-        self.cloud_interface.async_upload_part(
-            upload_metadata=self.upload_metadata,
-            key=self.key,
-            body=self.buffer,
-            part_number=self.counter,
-        )
+        try:
+            self.cloud_interface.async_upload_part(
+                upload_metadata=self.upload_metadata,
+                key=self.key,
+                body=self.buffer,
+                part_number=part_number,
+            )
+        except Exception:
+            # Keep the full part in memory for retry callers and preserve the part
+            # number sequence by not incrementing self.counter on failure.
+            self.buffer.seek(part_size, os.SEEK_SET)
+            raise
+        self.counter = part_number
         self.buffer.close()
         self.buffer = None
 
-    def flush(self):
-        # Maintained for compatibility — close() still calls it to drain the
-        # remaining data as the final (potentially smaller) trailing part.
-        self._upload_part_buffer()
+    def flush(self, is_final=False):
+        # Kept for compatibility. Non-final flushes require full chunk_size parts
+        # while final flushes may upload the trailing short part.
+        self._upload_part_buffer(is_final=is_final)
 
     def close(self):
         if self.tar:
@@ -352,7 +364,7 @@ class CloudTarUploader(object):
                     self.buffer = self._buffer()
                 self.buffer.write(final_bytes)
                 self.size += len(final_bytes)
-        self.flush()
+        self.flush(is_final=True)
         self.cloud_interface.async_complete_multipart_upload(
             upload_metadata=self.upload_metadata,
             key=self.key,
