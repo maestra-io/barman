@@ -23,16 +23,18 @@ overshoot in the buffer for the next part. See `barman/cloud.py` `_write_data` /
 
 When upstream tags 3.19+ with the fix merged, retire this fork.
 
-## Image
+## Images
 
-Built and pushed by `.github/workflows/release.yml` to:
+`.github/workflows/release.yml` builds two images on every push to `main` and on
+every `v*` tag, and pushes both to public ECR:
 
-```
-public.ecr.aws/g5f9s8a4/barman:latest
-public.ecr.aws/g5f9s8a4/barman:sha-<git-sha>
-```
+| repo | dockerfile | purpose |
+|---|---|---|
+| `public.ecr.aws/g5f9s8a4/barman` | `Dockerfile` | Standalone `barman-cloud-*` CLI (python:3.13-slim + snappy + lz4 + boto3). Reference / debug aid. |
+| `public.ecr.aws/g5f9s8a4/plugin-barman-cloud-sidecar` | `Dockerfile.sidecar` | Drop-in replacement for `ghcr.io/cloudnative-pg/plugin-barman-cloud-sidecar:v0.11.0`. Same Go `/manager` binary, but `/venv/lib/python3.13/site-packages/barman` replaced with patched 3.18.0. This is the one omicron's `plugin-barman-cloud-config.SIDECAR_IMAGE` points at. |
 
-The image is a standalone barman-cloud CLI (Python 3.13 slim, snappy + lz4 + boto3).
-To use it as a drop-in replacement for the CNPG plugin sidecar, override
-`/venv/lib/python3.13/site-packages/barman/cloud.py` (or rebuild the
-plugin-barman-cloud image with this barman wheel installed).
+Tags emitted (per `docker/metadata-action`):
+- `latest` (default branch only)
+- `main` (branch ref)
+- `sha-<short>` (every commit — pin via this in fluxcd)
+- `<semver>` / `<major>.<minor>` (when a `v*` tag is pushed)
