@@ -1,0 +1,33 @@
+# Drop-in replacement for ghcr.io/cloudnative-pg/plugin-barman-cloud-sidecar:v0.11.0
+# with patched barman 3.18.0 (PR #1161 — R2 multipart-uniform parts) installed
+# in place of the bundled 3.17.0.
+#
+# The sidecar's Go binary `/manager` (cnpg-i gRPC server) is preserved as-is;
+# only the Python `barman` package under
+#   /venv/lib/python3.13/site-packages/barman
+# is replaced. Entrypoint, user (26:26 = postgres), workdir, and env are
+# inherited from the upstream image.
+#
+# The upstream sidecar is distroless and its venv has no pip, so we build
+# barman 3.18.0 with the builder's pip and copy only the package directory
+# back over the upstream image.
+
+ARG SIDECAR_BASE=ghcr.io/cloudnative-pg/plugin-barman-cloud-sidecar:v0.11.0
+
+FROM python:3.13-slim AS builder
+
+COPY . /tmp/barman-src
+RUN pip install --no-cache-dir --no-deps --target /tmp/barman-install /tmp/barman-src \
+    && grep -q "is_final" /tmp/barman-install/barman/cloud.py
+
+FROM ${SIDECAR_BASE}
+
+LABEL org.opencontainers.image.source="https://github.com/maestra-io/barman"
+LABEL org.opencontainers.image.description="cnpg plugin-barman-cloud sidecar with patched barman 3.18.0 (R2 multipart-uniform parts, PR #1161)"
+LABEL org.opencontainers.image.licenses="GPL-3.0-or-later"
+
+# Replace ONLY the barman package — leave boto3, snappy, lz4, cramjam,
+# google-cloud-storage, azure-storage-blob, setuptools (which provides
+# _distutils_hack for `import distutils.version`), etc. that the upstream
+# image already has at compatible versions.
+COPY --from=builder /tmp/barman-install/barman /venv/lib/python3.13/site-packages/barman
