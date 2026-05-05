@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  push:
+    branches: [ main ]
+    tags:
+      - 'v*'
+    paths-ignore:
+      - '**/*.md'
+      - '.gitignore'
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: us-east-1   # ecr-public is only callable in us-east-1
+  ECR_REGISTRY: public.ecr.aws/g5f9s8a4
+  ECR_REPOSITORY: barman
+  TELEPORT_FQDN: teleport.maestra.io:443
+  TELEPORT_TOKEN: image-push-github-actions-barman
+  AWS_ROLE_ARN: arn:aws:iam::515260921971:role/teleport-image-push
+
+jobs:
+  image:
+    name: Build & push image to public ECR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Get Teleport version
+        id: tp-version
+        run: |
+          VERSION=$(curl -sf "https://${{ env.TELEPORT_FQDN }}/webapi/find" | jq -r '.auto_update.tools_version // .server_version')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v5
+        with:
+          path: ${{ runner.tool_cache }}/teleport
+          key: teleport-${{ steps.tp-version.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
+
+      - uses: teleport-actions/setup@v1
+        with:
+          version: ${{ steps.tp-version.outputs.version }}
+          proxy: ${{ env.TELEPORT_FQDN }}
+
+      - name: Public ECR login via Teleport Workload Identity
+        run: |
+          cat > /tmp/tbot.yaml << EOF
+          version: v2
+          proxy_server: ${{ env.TELEPORT_FQDN }}
+          onboarding:
+            join_method: github
+            token: ${{ env.TELEPORT_TOKEN }}
+          oneshot: true
+          storage:
+            type: memory
+          services:
+            - type: workload-identity-jwt
+              destination:
+                type: directory
+                path: /tmp/tbot-output
+              selector:
+                name: image-push
+              audiences: ["sts.amazonaws.com"]
+          EOF
+
+          mkdir -p /tmp/tbot-output
+          tbot start -c /tmp/tbot.yaml || true
+          test -f /tmp/tbot-output/jwt_svid
+
+          pip install -q awscli
+          export AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/tbot-output/jwt_svid
+          export AWS_ROLE_ARN="${{ env.AWS_ROLE_ARN }}"
+          export AWS_DEFAULT_REGION=${{ env.AWS_REGION }}
+
+          # ecr-public API is only callable in us-east-1, even though the
+          # registry itself is global. The repository is created on first run.
+          aws ecr-public describe-repositories --repository-names "${{ env.ECR_REPOSITORY }}" --region "${{ env.AWS_REGION }}" 2>/dev/null || \
+            aws ecr-public create-repository --repository-name "${{ env.ECR_REPOSITORY }}" --region "${{ env.AWS_REGION }}"
+
+          PASSWORD=$(aws ecr-public get-login-password --region "${{ env.AWS_REGION }}")
+          echo "$PASSWORD" | docker login public.ecr.aws --username AWS --password-stdin
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/metadata-action@v6
+        id: meta
+        with:
+          images: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
