@@ -21,10 +21,15 @@ This module represents a backup.
 """
 
 import datetime
+import filecmp
+import io
+import json
 import logging
 import os
 import re
 import shutil
+import sys
+import tarfile
 import tempfile
 from collections import defaultdict
 from contextlib import closing
@@ -48,7 +53,7 @@ from barman.backup_executor import (
     SnapshotBackupExecutor,
 )
 from barman.backup_manifest import BackupManifest
-from barman.cloud import CloudBackupCatalog
+from barman.cloud import CloudBackupCatalog, CloudWalDownloader
 from barman.cloud_providers import (
     get_snapshot_interface_from_backup_info,
     recognize_cloud_provider,
@@ -62,21 +67,28 @@ from barman.exceptions import (
     BackupException,
     CommandFailedException,
     CompressionIncompatibility,
-    DuplicateWalFile,
+    ExportBackupException,
+    ImportBackupException,
     LockFileBusy,
-    MatchingDuplicateWalFile,
     SshCommandException,
     UnknownBackupIdException,
 )
 from barman.fs import unix_command_factory
 from barman.hooks import HookScriptRunner, RetryHookScriptRunner
-from barman.infofile import BackupInfo, BackupInfoFactory, WalFileInfo
+from barman.infofile import (
+    BackupInfo,
+    BackupInfoFactory,
+    CloudLocalBackupInfo,
+    LocalBackupInfo,
+    WalFileInfo,
+)
 from barman.lockfile import ServerBackupIdLock, ServerBackupSyncLock
 from barman.recovery_executor import recovery_executor_factory
 from barman.remote_status import RemoteStatusMixin
 from barman.storage.local_file_manager import LocalFileManager
 from barman.utils import (
     SHA256,
+    BarmanEncoderV2,
     force_str,
     fsync_dir,
     fsync_file,
@@ -88,9 +100,14 @@ from barman.utils import (
     human_readable_timedelta,
     pretty_size,
 )
-from barman.wal_archiver import CloudWalStorageStrategy
+from barman.wal_archiver import CloudWalArchiver, CloudWalStorageStrategy
 
 _logger = logging.getLogger(__name__)
+
+# Prefix for pg_tblspc symlinks in exported tarballs. Members matching
+# this prefix exactly (no further '/') are skipped by _extract_tarball
+# and reconstructed by _reconstruct_tablespace_symlinks.
+_PG_TBLSPC_TARBALL_PREFIX = "backup/data/pg_tblspc/"
 
 
 class BackupManager(RemoteStatusMixin, KeepManagerMixin):
@@ -115,24 +132,25 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
             self.server.meta_directory, self.server.config.basebackups_directory
         )
         self.executor = None
-        try:
-            if server.passive_node:
-                self.executor = PassiveBackupExecutor(self)
-            elif self.config.backup_method == "local-to-cloud":
-                self.executor = CloudBackupExecutor(self)
-            elif self.config.backup_method == "postgres":
-                if recognize_cloud_provider(self.config.basebackups_directory):
-                    self.executor = CloudPostgresBackupExecutor(self)
+        if self.config.active:
+            try:
+                if server.passive_node:
+                    self.executor = PassiveBackupExecutor(self)
+                elif self.config.backup_method == "local-to-cloud":
+                    self.executor = CloudBackupExecutor(self)
+                elif self.config.backup_method == "postgres":
+                    if recognize_cloud_provider(self.config.basebackups_directory):
+                        self.executor = CloudPostgresBackupExecutor(self)
+                    else:
+                        self.executor = PostgresBackupExecutor(self)
+                elif self.config.backup_method == "local-rsync":
+                    self.executor = RsyncBackupExecutor(self, local_mode=True)
+                elif self.config.backup_method == "snapshot":
+                    self.executor = SnapshotBackupExecutor(self)
                 else:
-                    self.executor = PostgresBackupExecutor(self)
-            elif self.config.backup_method == "local-rsync":
-                self.executor = RsyncBackupExecutor(self, local_mode=True)
-            elif self.config.backup_method == "snapshot":
-                self.executor = SnapshotBackupExecutor(self)
-            else:
-                self.executor = RsyncBackupExecutor(self)
-        except SshCommandException as e:
-            self.config.update_msg_list_and_disable_server(force_str(e).strip())
+                    self.executor = RsyncBackupExecutor(self)
+            except SshCommandException as e:
+                self.config.update_msg_list_and_disable_server(force_str(e).strip())
 
     @property
     def mode(self):
@@ -202,6 +220,34 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
         for filename in glob("%s/*-backup.info" % self.server.meta_directory):
             backup = BackupInfoFactory.build_backup_info(self.server, filename)
             self._backup_cache[backup.backup_id] = backup
+        # If the server is disabled and configured to use cloud storage for backups, it
+        # might be a new Barman instance on a target host configured specifically for
+        # restoring a cloud backup taken by another Barman instance. In that case, we
+        # should load the backup.info files from the cloud storage to populate the
+        # backup cache so that list-backups, show-backup and restore operations work
+        if not self.config.active and self.server.use_backup_cloud_storage:
+            self._load_backups_from_cloud()
+
+    def _load_backups_from_cloud(self):
+        """
+        Fetch ``backup.info`` files from the cloud storage and populate the cache.
+        """
+        cloud_catalog = CloudBackupCatalog(
+            cloud_interface=self.server.get_backup_cloud_interface(),
+            server_name=self.config.name,
+        )
+        backup_list = cloud_catalog.get_backup_list()
+        for bk_name, bk_info in backup_list.items():
+            # get_backup_list() returns a dict of BackupInfo objects. To be more
+            # accurate with types, we convert them to CloudLocalBackupInfo objects
+            buffer = io.BytesIO()
+            bk_info.save(file_object=buffer)
+            buffer.seek(0)
+            cloud_backup_info = CloudLocalBackupInfo(
+                server=self.server, backup_id=bk_info.backup_id
+            )
+            cloud_backup_info.load(file_object=buffer)
+            self._backup_cache[bk_name] = cloud_backup_info
 
     def backup_cache_add(self, backup_info):
         """
@@ -1273,7 +1319,7 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
         for archiver in self.server.archivers:
             archiver.archive(verbose)
 
-    def cloud_wal_archive(self, wal_path):
+    def cloud_wal_archive(self, wal_path, parallel=0):
         """
         Archive a WAL file to cloud storage.
 
@@ -1303,27 +1349,14 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
             from ``pg_wal``.
 
         :param str wal_path: the path of the WAL file to archive
+        :param int parallel: number of WALs to archive in parallel (0=disabled)
         """
-        # Get a WAL file info and the compressor/encryptor, similar to what is done
-        # through WalArchiver when running 'barman archive-wal'.
-        wal_info = WalFileInfo.from_file(
-            filename=wal_path,
-            compression_manager=self.compression_manager,
-            unidentified_compression=None,
-            encryption_manager=self.encryption_manager,
-            encryption=None,
-        )
-        compressor = self.compression_manager.get_default_compressor()
-        encryption = self.encryption_manager.get_encryption()
-
-        wal_storage = self.server.wal_storage
-
         # In the docstring we mention we don't perform validation here, but we still
         # want to make sure that the WAL storage strategy is compatible with this
         # method, otherwise we can end up in a situation where the WAL file is
         # removed/modified without being archived in cloud storage, which can cause data
         # loss.
-        if not isinstance(wal_storage, CloudWalStorageStrategy):
+        if not isinstance(self.server.wal_storage, CloudWalStorageStrategy):
             output.error(
                 "The 'cloud-wal-archive' command can only be used with cloud WAL "
                 "storage strategies. Please check your server configuration and ensure "
@@ -1331,29 +1364,23 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
             )
             return
 
-        try:
-            # We skip the delete because the WAL file is expected to be inside 'pg_wal',
-            # not inside the 'incoming' directory.
-            wal_storage.save(compressor, encryption, wal_info, skip_delete=True)
-            output.info("WAL file %s archived in cloud storage.", wal_info.name)
-        except MatchingDuplicateWalFile:
-            output.info(
-                "WAL file %s is already archived in cloud storage, skipping.",
-                wal_info.name,
-            )
-        except DuplicateWalFile:
-            output.warning(
-                "WAL file %s is already archived in cloud storage of server %s but "
-                "with different content",
-                wal_info.name,
-                self.config.name,
-            )
-            # We copy instead of moving the WAL file to the errors directory because
-            # 'wal_info.path' points to a WAL inside 'pg_wal', and should not be
-            # modified by Barman.
-            self.server.copy_wal_file_to_errors_directory(
-                wal_info.orig_filename, wal_info.name, "duplicate"
-            )
+        cloud_archiver = CloudWalArchiver(self)
+        cloud_archiver.archive(wal_path, parallel)
+
+    def cloud_wal_restore(self, wal_name, wal_dest, spool_dir):
+        """
+        Restore a WAL file from a cloud object storage.
+
+        :param str wal_name: the name of the WAL file to restore
+        :param str wal_dest: the destination path where to restore the WAL file
+        :param str spool_dir: the spool directory for extra WALs fetched in parallel
+        """
+        cloud_interface = self.server.get_wal_cloud_interface()
+        parallel = self.config.cloud_wal_restore_parallel
+        wal_downloader = CloudWalDownloader(
+            cloud_interface, self.config.name, spool_dir
+        )
+        wal_downloader.download_wal(wal_name, wal_dest, False, parallel)
 
     def cron_retention_policy(self):
         """
@@ -1502,9 +1529,21 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
         # In the future we might replace this with just calling the cloud interface's
         # delete_under_prefix method instead, but currently that is only implemented for S3
         cloud_interface = self.server.get_backup_cloud_interface()
+        if self.config.aws_check_object_lock:
+            from barman.cloud_providers.aws_s3 import S3CloudInterface
+
+            if not isinstance(cloud_interface, S3CloudInterface):
+                _logger.warning(
+                    "aws_check_object_lock is only supported for S3 storage. "
+                    "Object lock checks will not be performed for server '%s'.",
+                    self.config.name,
+                )
         objects_keys = [k for k in cloud_interface.list_bucket(backup_path + "/")]
         _logger.debug("Deleting all backup data from cloud path: %s" % backup_path)
-        cloud_interface.delete_objects(objects_keys)
+        cloud_interface.delete_objects(
+            objects_keys,
+            check_locks=self.config.aws_check_object_lock,
+        )
         # Lastly delete the backup manifest from the local meta dir, if it exists
         manifest_path = backup.get_backup_manifest_path()
         if os.path.exists(manifest_path):
@@ -1838,9 +1877,7 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
         backup_id = self.get_last_backup_id()
         if backup_id:
             # Get the backup object
-            backup = BackupInfoFactory.build_backup_info(
-                self.server, backup_id=backup_id
-            )
+            backup = self.get_backup(backup_id)
             if backup.size < last_backup_minimum_size:
                 return False, backup.size
             else:
@@ -2011,6 +2048,1036 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
             output.error(e.args[0]["err"])
             return
         output.info(pg_verifybackup.get_output()[0].strip())
+
+    def export_backup(
+        self,
+        backup_info,
+        output_filepath,
+        identity_data,
+        barman_data,
+        compression=None,
+        compression_level=None,
+    ):
+        """
+        Export a completed backup to a portable tarball format.
+
+        This method creates a tarball containing:
+        - ``identity.json`` from server
+        - ``backup.info`` metadata
+        - ``barman.json`` with system information
+        - ``backup/`` directory with complete backup data
+        - ``wals/`` directory with all required WAL files preserving hash structure
+        - ``xlog.db`` metadata file for exported WAL files
+
+        Metadata files are written first so that the importer can validate
+        server identity in streaming mode (``r|*``) before reading bulk data.
+
+        The caller (server.py) is responsible for:
+        - Generating the export filename
+        - Collecting server-level metadata
+        - Handling checksum calculation and file renaming
+        - Cleanup on failure
+
+        :param BackupInfo backup_info: the backup to export
+        :param str output_filepath: full path to the output tarball file
+        :param dict identity_data: server identity information
+        :param dict barman_data: system information for ``barman.json``
+        :param str|None compression: compression algorithm (``gzip``, ``bzip2``,
+            ``xz``) or ``None`` for no compression
+        :param int|None compression_level: compression level to pass to the
+            compressor, or ``None`` for the default level
+        """
+        output.debug("Starting export of backup '%s'" % backup_info.backup_id)
+
+        # Get source backup directory
+        backup_dir = backup_info.get_basebackup_directory()
+
+        # Given the CLI module already handles the validation of compression and
+        # compression_level parameters, this branch is not expected to be hit, but we
+        # add a defensive check here just in case.
+        if compression is None and compression_level is not None:
+            output.warning(
+                "Compression level specified without compression algorithm, ignoring "
+                "compression level"
+            )
+            compression_level = None
+
+        # Build tarfile mode string and keyword arguments for compression
+        compression_modes = {"gzip": "gz", "bzip2": "bz2", "xz": "xz"}
+        mode_suffix = compression_modes.get(compression, "")
+        tar_mode = "w|%s" % mode_suffix if mode_suffix else "w|"
+
+        # ``tarfile`` only accepts the compression-level keyword argument for
+        # streaming modes on recent interpreters: ``compresslevel`` for
+        # ``w|gz`` / ``w|bz2`` requires Python 3.12+, and ``preset`` for
+        # ``w|xz`` requires Python 3.14+. On older interpreters we warn and
+        # fall back to the algorithm's default level so the export still
+        # succeeds.
+        tar_kwargs = {}
+        if compression_level is not None:
+            if compression == "xz":
+                kwarg_name = "preset"
+                required_version = (3, 14)
+            else:
+                kwarg_name = "compresslevel"
+                required_version = (3, 12)
+
+            if sys.version_info < required_version:
+                output.warning(
+                    "Python %d.%d does not support '%s' for streaming tar mode '%s'; "
+                    "ignoring compression level and using the algorithm's default "
+                    "level. Requires Python %d.%d or later.",
+                    sys.version_info[0],
+                    sys.version_info[1],
+                    kwarg_name,
+                    tar_mode,
+                    required_version[0],
+                    required_version[1],
+                )
+            else:
+                tar_kwargs[kwarg_name] = compression_level
+
+        # Create the export tarball
+        output.debug("Creating export tarball at '%s'" % output_filepath)
+
+        with tarfile.open(output_filepath, tar_mode, **tar_kwargs) as tar:
+            # Add metadata files first so that the importer can validate
+            # identity before reading the bulk data in streaming mode (r|*)
+            self._add_metadata_to_tar(tar, identity_data, backup_info, barman_data)
+
+            # Add backup data with backup/ prefix
+            output.debug("Adding backup data from '%s'" % backup_dir)
+            tar.add(backup_dir, arcname="backup")
+
+            # Add WAL files and xlog.db
+            self._add_wal_data_to_tar(tar, backup_info)
+
+    def _add_metadata_to_tar(self, tar, identity_data, backup_info, barman_data):
+        """
+        Add metadata files to the tarball root.
+
+        :param TarFile tar: the tar file object
+        :param dict identity_data: server identity information
+        :param BackupInfo backup_info: backup information object
+        :param dict barman_data: system information
+        """
+        output.debug("Adding metadata files")
+
+        # Add identity.json
+        # 'identity_data' is known to be non-empty at this point, otherwise
+        # the Server.export_backup would have errored out before.
+        identity_json = json.dumps(identity_data, indent=4, sort_keys=True)
+        self._add_json_to_tar(tar, "identity.json", identity_json)
+
+        # Add backup.info file directly (preserves original format)
+        tar.add(backup_info.get_filename(), arcname="backup.info")
+
+        # Add barman.json
+        barman_json = json.dumps(
+            barman_data, cls=BarmanEncoderV2, indent=4, sort_keys=True
+        )
+        self._add_json_to_tar(tar, "barman.json", barman_json)
+
+    def _add_json_to_tar(self, tar, filename, json_content):
+        """
+        Add a JSON string as a file to the tarball.
+
+        :param TarFile tar: the tar file object
+        :param str filename: name of the file in the tarball
+        :param str json_content: JSON string content
+        """
+        json_bytes = json_content.encode("utf-8")
+        tarinfo = tarfile.TarInfo(name=filename)
+        tarinfo.size = len(json_bytes)
+        tarinfo.mode = 0o644
+
+        tar.addfile(tarinfo, io.BytesIO(json_bytes))
+
+    def _add_wal_data_to_tar(self, tar, backup_info):
+        """
+        Add WAL files and xlog.db metadata to the tarball.
+
+        This method exports all WAL files required for backup consistency
+        from begin_wal to end_wal (inclusive) and creates an xlog.db file
+        containing metadata for the exported WAL files. Uses a single-pass
+        merge-step algorithm, isolated in a helper method.
+
+        Uses a temporary file to avoid memory overhead when exporting backups
+        with many WAL files.
+
+        :param TarFile tar: the tar file object
+        :param BackupInfo backup_info: the backup information
+        """
+        output.debug("Adding WAL files to export")
+
+        # Use export directory for temporary file to avoid memory overhead. As the
+        # export directory is expected to be big enough to hold the tarball, it should
+        # also be big enough to hold the temporary xlog.db file, which is very small
+        # compared to the tarball.
+        export_dir = os.path.dirname(tar.name)
+        xlogdb_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", dir=export_dir, suffix=".xlogdb", delete=False
+            ) as xlogdb_file:
+                xlogdb_path = xlogdb_file.name
+                wal_count = self._collect_wal_files_for_export(
+                    tar, backup_info, xlogdb_file
+                )
+
+            # Add xlog.db to tar
+            tar.add(xlogdb_path, arcname="xlog.db")
+
+            output.debug("Successfully added %d WAL files to export" % wal_count)
+        finally:
+            # Clean up temp file
+            if xlogdb_path and os.path.exists(xlogdb_path):
+                os.unlink(xlogdb_path)
+
+    def _collect_wal_files_for_export(self, tar, backup_info, xlogdb_file):
+        """
+        Merge-step algorithm for collecting WAL files and xlog.db metadata for export.
+
+        Writes xlog.db lines directly to the provided file object to avoid
+        memory overhead for backups with many WAL files.
+
+        :param TarFile tar: the tar file object
+        :param BackupInfo backup_info: the backup information
+        :param file xlogdb_file: file object to write xlog.db metadata lines
+        :return: count of WAL files added to the tarball
+        :rtype: int
+        :raises ExportBackupException: for WAL/xlogdb mismatches or missing files
+        """
+        required_wals = backup_info.get_required_wal_segments()
+        # There is no need to add a fallback value for next() here because the CLI
+        # filters for DONE backups, which are guaranteed to have at least one required
+        # WAL segment, even if begin_wal is equal to end_wal.
+        current_required = next(required_wals)
+        wal_count = 0
+
+        with self.server.xlogdb("r") as fxlogdb:
+            for line in fxlogdb:
+                if current_required is None:
+                    # At this point we found all required WAL files, so we can stop
+                    # iterating through xlog.db
+                    break
+                wal_info = WalFileInfo.from_xlogdb_line(line)
+                if wal_info.name < current_required:
+                    continue
+                if wal_info.name > current_required:
+                    # Stop iterating as we did not find the required WAL in xlog.db.
+                    # That will cause execution to error out of the loop and report the
+                    # missing WAL file.
+                    break
+                wal_path = wal_info.fullpath(self.server)
+                if not os.path.exists(wal_path):
+                    raise ExportBackupException(
+                        "WAL file required for backup consistency not found for backup "
+                        "'%s': %s" % (backup_info.backup_id, wal_info.name)
+                    )
+                tar_path = "wals/%s" % wal_info.relpath()
+                tar.add(wal_path, arcname=tar_path)
+                xlogdb_file.write(line)
+                wal_count += 1
+                current_required = next(required_wals, None)
+
+        if current_required is not None:
+            raise ExportBackupException(
+                "WAL file required for backup consistency not found in xlog.db for "
+                "backup '%s': %s" % (backup_info.backup_id, current_required)
+            )
+        return wal_count
+
+    def import_backup(self, input_tarball, local_identity, backup_id):
+        """
+        Import a backup from an exported tarball into the Barman catalog.
+
+        Extracts the tarball to a temporary staging directory, validates server
+        identity, registers backup metadata, moves backup data to the target
+        location, imports WAL files and merges xlog.db entries. Uses a staging
+        directory to make the write to the catalog atomic — a failed import
+        leaves no partial state.
+
+        :param str input_tarball: path to the exported backup tarball
+        :param dict local_identity: local server identity data for validation
+        :param str backup_id: the backup ID extracted from the tarball filename
+        :raises ImportBackupException: on identity mismatch or invalid tarball
+        """
+        output.debug("Starting import of backup from '%s'" % input_tarball)
+
+        # Check that the backup_id doesn't already exist in the catalog
+        existing = self.get_backup(backup_id)
+        if existing is not None:
+            raise ImportBackupException(
+                "Backup '%s' already exists in the catalog for server '%s'"
+                % (backup_id, self.config.name)
+            )
+
+        # Validate server identity before extracting
+        export_identity = self._read_identity_from_tarball(input_tarball)
+        self._validate_import_identity(export_identity, local_identity)
+
+        # Construct the BackupInfo object up front so that knowledge about
+        # where the catalog lives on disk (target data directory, canonical
+        # backup.info path) stays inside LocalBackupInfo rather than being
+        # rebuilt from config + backup_id at multiple call sites.
+        backup_info = LocalBackupInfo(self.server, backup_id=backup_id)
+
+        staging_dir = tempfile.mkdtemp(
+            dir=self.config.basebackups_directory,
+            prefix=".import-",
+        )
+
+        try:
+            # Extract tarball to staging directory
+            output.debug("Extracting tarball to staging directory '%s'" % staging_dir)
+            self._extract_tarball(input_tarball, staging_dir)
+
+            # Pre-flight: verify the staging contents are structurally
+            # valid and that the staged WAL set is safe to publish, BEFORE
+            # we touch the catalog or move any data. ``backup_info`` is
+            # populated as a side effect (still not persisted to the
+            # catalog; ``_import_backup_metadata`` re-loads idempotently
+            # and saves later).
+            self._verify_staging(staging_dir, backup_info)
+
+            # Refuse incremental backups: a block-level incremental backup is
+            # only meaningful as part of its parent chain. Importing one in
+            # isolation would leave the catalog referencing a parent that
+            # may not exist on the target server.
+            # Given export-backup disallows incremental backups, this branch should
+            # never be exercised, but we add a safeguard just in case.
+            if backup_info.is_incremental:
+                raise ImportBackupException(
+                    "Cannot import backup %s into server %s: it is an "
+                    "incremental backup.\nOnly full backups are eligible "
+                    "for importing." % (backup_info.backup_id, self.config.name)
+                )
+
+            # Recreate pg_tblspc symlinks that were skipped during tar
+            # extraction.  Must run after _verify_staging so that
+            # backup_info.tablespaces is populated from backup.info.
+            self._reconstruct_tablespace_symlinks(staging_dir, backup_info)
+
+            # Move backup data to its target location
+            self._import_backup_data(staging_dir, backup_info)
+
+            # Import WAL files and merge xlog.db entries. Returns a rollback
+            # callable that undoes WAL moves and restores the original xlog.db
+            # if a later step fails. If WAL import itself fails, roll back
+            # the moved basebackup directory so the import leaves no partial
+            # state on disk.
+            try:
+                wal_rollback = self._import_backup_wals(staging_dir)
+            except Exception:
+                target_dir = backup_info.get_basebackup_directory()
+                if os.path.exists(target_dir):
+                    shutil.rmtree(target_dir, ignore_errors=True)
+                raise
+
+            # Register backup metadata. If this fails, roll back WAL import
+            # and data move so we do not leave orphaned state on disk.
+            try:
+                self._import_backup_metadata(staging_dir, backup_info)
+            except Exception:
+                wal_rollback()
+                target_dir = backup_info.get_basebackup_directory()
+                if os.path.exists(target_dir):
+                    shutil.rmtree(target_dir, ignore_errors=True)
+                raise
+
+            output.info(
+                "Successfully imported backup '%s' into server '%s'"
+                % (backup_info.backup_id, self.config.name)
+            )
+
+            # Apply KEEP:STANDALONE annotation to protect the imported backup
+            # from automatic deletion by retention policies. Failures are
+            # non-fatal: the import has already succeeded at this point.
+            try:
+                self.keep_backup(backup_info.backup_id, KeepManager.TARGET_STANDALONE)
+                output.debug(
+                    "Applied KEEP:STANDALONE annotation to backup '%s'"
+                    % backup_info.backup_id
+                )
+            except Exception as e:
+                output.warning(
+                    "Failed to apply KEEP:STANDALONE annotation to backup "
+                    "'%s' on server '%s': %s. The imported backup may be "
+                    "subject to retention policy deletion."
+                    % (backup_info.backup_id, self.config.name, e)
+                )
+        finally:
+            # Clean up the staging directory, removing leftovers
+            # From successful or failed operations
+            if os.path.exists(staging_dir):
+                shutil.rmtree(staging_dir)
+
+    def _extract_tarball(self, input_tarball, staging_dir):
+        """
+        Extract the exported tarball to a staging directory.
+
+        Uses streaming mode (``r|*``) to keep only one TarInfo object in
+        memory at a time, avoiding excessive memory usage for tarballs with
+        many files.
+
+        :param str input_tarball: path to the tarball
+        :param str staging_dir: target directory for extraction
+        :raises ImportBackupException: if extraction fails or an unsafe member
+            is encountered. Symlinks under ``backup/data/pg_tblspc/`` are
+            skipped rather than rejected.
+        """
+        try:
+            with tarfile.open(input_tarball, "r|*") as tar:
+                real_staging_dir = os.path.realpath(staging_dir)
+                for member in tar:
+                    # Security: prevent path traversal attacks. Compare against
+                    # ``staging_dir + os.sep`` so that a sibling directory whose
+                    # name is a string-prefix of the staging dir cannot slip
+                    # through (e.g. ``.import-abc`` vs ``.import-abcXYZ``).
+                    member_path = os.path.join(staging_dir, member.name)
+                    real_member_path = os.path.realpath(member_path)
+                    if real_member_path != real_staging_dir and not (
+                        real_member_path.startswith(real_staging_dir + os.sep)
+                    ):
+                        raise ImportBackupException(
+                            "Tarball contains unsafe path: '%s'" % member.name
+                        )
+                    # Security: reject links and other special file types.
+                    # Only regular files and directories are expected in an
+                    # exported backup tarball, with the single exception of
+                    # pg_tblspc symlinks (see below).
+                    if member.issym():
+                        # pg_basebackup emits tablespace entries as symlinks
+                        # directly under ``data/pg_tblspc/``.  These are
+                        # legitimate — skip them here and let
+                        # ``_reconstruct_tablespace_symlinks`` recreate them
+                        # with the correct destination-catalog paths after
+                        # ``backup.info`` has been loaded.
+                        # Any other symlink (including nested paths such as
+                        # ``backup/data/pg_tblspc/oid/something``) is still
+                        # rejected as a potential path-traversal vector.
+                        if (
+                            member.name.startswith(_PG_TBLSPC_TARBALL_PREFIX)
+                            and "/" not in member.name[len(_PG_TBLSPC_TARBALL_PREFIX) :]
+                        ):
+                            continue
+                        raise ImportBackupException(
+                            "Tarball contains unsafe member type: '%s'" % member.name
+                        )
+                    if not (member.isdir() or member.isreg()):
+                        raise ImportBackupException(
+                            "Tarball contains unsafe member type: '%s'" % member.name
+                        )
+                    tar.extract(member, path=staging_dir)
+        except (tarfile.TarError, OSError) as e:
+            raise ImportBackupException(
+                "Failed to extract tarball '%s': %s" % (input_tarball, e)
+            )
+
+    def _reconstruct_tablespace_symlinks(self, staging_dir, backup_info):
+        """
+        Recreate ``pg_tblspc`` symlinks in the staging directory after tarball
+        extraction.
+
+        ``pg_basebackup`` emits tablespace entries as symlinks directly under
+        ``data/pg_tblspc/<oid>``.  :meth:`_extract_tarball` skips these
+        members to avoid the broad symlink-rejection check.  This method
+        recreates them pointing to the correct destination-catalog paths
+        (``backup_info.get_data_directory(oid)``) before the staging
+        ``backup/`` tree is moved to its final location by
+        :meth:`_import_backup_data`.
+
+        This is a no-op when *backup_info* carries no tablespaces.
+
+        :param str staging_dir: path to the staging directory
+        :param LocalBackupInfo backup_info: backup info whose
+            ``tablespaces`` attribute provides the OID list
+        :raises ImportBackupException: if a symlink cannot be created
+        """
+        if not backup_info.tablespaces:
+            return
+
+        pg_tblspc_dir = os.path.join(staging_dir, "backup", "data", "pg_tblspc")
+        if not os.path.isdir(pg_tblspc_dir):
+            try:
+                os.makedirs(pg_tblspc_dir)
+            except OSError as e:
+                raise ImportBackupException(
+                    "Failed to create pg_tblspc directory '%s': %s" % (pg_tblspc_dir, e)
+                )
+
+        for tablespace in backup_info.tablespaces:
+            link_path = os.path.join(pg_tblspc_dir, str(tablespace.oid))
+            target_path = backup_info.get_data_directory(tablespace.oid)
+
+            # ``lexists`` (not ``exists``) so that a broken symlink — one
+            # whose target no longer exists — still enters this branch and
+            # is inspected. ``exists`` follows links and would skip such an
+            # entry, leaving it in place to break the ``os.symlink`` call
+            # below. Refuse to remove a real directory: ``os.path.isdir``
+            # follows symlinks, so pairing it with ``not islink`` isolates
+            # the real-directory case (suspicious, abort) from the symlink-
+            # to-directory case (a stale link from a previous import, safe
+            # to replace).
+            if os.path.lexists(link_path):
+                if os.path.isdir(link_path) and not os.path.islink(link_path):
+                    raise ImportBackupException(
+                        "Cannot replace existing directory at tablespace link "
+                        "path '%s'" % link_path
+                    )
+                try:
+                    os.unlink(link_path)
+                except OSError as e:
+                    raise ImportBackupException(
+                        "Failed to remove existing tablespace link path "
+                        "'%s': %s" % (link_path, e)
+                    )
+            try:
+                os.symlink(target_path, link_path)
+            except OSError as e:
+                raise ImportBackupException(
+                    "Failed to create tablespace symlink '%s' -> '%s': %s"
+                    % (link_path, target_path, e)
+                )
+
+    def _read_identity_from_tarball(self, input_tarball):
+        """
+        Read identity.json directly from the tarball without extracting.
+
+        Uses streaming mode (``r|*``) to avoid loading all TarInfo objects
+        into memory. Since the export writes metadata first, identity.json
+        is found immediately.
+
+        :param str input_tarball: path to the tarball
+        :return: parsed identity data
+        :rtype: dict
+        :raises ImportBackupException: if identity.json is missing or unreadable
+        """
+        try:
+            with tarfile.open(input_tarball, "r|*") as tar:
+                for member in tar:
+                    if member.name == "identity.json":
+                        f = tar.extractfile(member)
+                        if f is None:
+                            raise ImportBackupException(
+                                "identity.json in tarball is not a regular file"
+                            )
+                        with closing(f):
+                            return json.loads(f.read().decode("utf-8"))
+                raise ImportBackupException(
+                    "Exported tarball does not contain identity.json"
+                )
+        except tarfile.TarError as e:
+            raise ImportBackupException(
+                "Failed to read identity.json from tarball: %s" % e
+            )
+        except (ValueError, json.JSONDecodeError) as e:
+            raise ImportBackupException(
+                "Failed to parse identity.json from tarball: %s" % e
+            )
+
+    def _validate_import_identity(self, export_identity, local_identity):
+        """
+        Validate that the exported backup belongs to the target server by
+        comparing identity data.
+
+        :param dict export_identity: identity data from the exported tarball
+        :param dict local_identity: local server identity data
+        :raises ImportBackupException: if identity validation fails
+        """
+        # Validate systemid match
+        # "systemid" is expected to always be present in the identity data
+        export_systemid = export_identity["systemid"]
+        local_systemid = local_identity["systemid"]
+
+        if export_systemid != local_systemid:
+            raise ImportBackupException(
+                "Server identity mismatch: exported backup has systemid '%s' "
+                "but target server has systemid '%s'"
+                % (export_systemid, local_systemid)
+            )
+
+        # Warn on PostgreSQL version mismatch (non-blocking)
+        # "version" is expected to always be present in the identity data
+        export_version = export_identity["version"]
+        local_version = local_identity["version"]
+        if export_version != local_version:
+            output.warning(
+                "PostgreSQL version mismatch: exported backup has version '%s' "
+                "but target server has version '%s'" % (export_version, local_version)
+            )
+
+    def _import_backup_metadata(self, staging_dir, backup_info):
+        """
+        Load backup.info from the staging directory into ``backup_info``,
+        persist it to the catalog, and register it in the cache. Assumes
+        the pre-flight in :meth:`import_backup` has already verified that
+        ``backup.info`` exists in the staging dir.
+
+        :param str staging_dir: path to the staging directory
+        :param LocalBackupInfo backup_info: the backup info object to
+            populate from the staging file and register in the catalog
+        :raises ImportBackupException: if metadata loading or registration fails
+        """
+        backup_info_path = os.path.join(staging_dir, "backup.info")
+
+        try:
+            backup_info.load(filename=backup_info_path)
+            backup_info.save()
+        except Exception as e:
+            raise ImportBackupException("Failed to load backup.info: %s" % e)
+
+        # Register in cache
+        self.backup_cache_add(backup_info)
+
+    def _verify_staging(self, staging_dir, backup_info):
+        """
+        Pre-flight: confirm the extracted staging directory is structurally
+        valid and that the staged WAL set will be safe to publish into the
+        catalog. Loads ``backup.info`` from staging into *backup_info* as
+        a side effect so callers don't have to do it separately
+        (:meth:`_import_backup_metadata` will re-load idempotently and persist
+        later).
+
+        :param str staging_dir: path to the staging directory
+        :param LocalBackupInfo backup_info: backup info object to populate
+            from the staging ``backup.info`` and use for WAL verification
+        :raises ImportBackupException: on any structural or WAL-set issue
+        """
+        self._verify_staging_layout(staging_dir)
+
+        backup_info_path = os.path.join(staging_dir, "backup.info")
+        try:
+            backup_info.load(filename=backup_info_path)
+        except Exception as e:
+            raise ImportBackupException("Failed to load backup.info: %s" % e)
+
+        self._verify_staged_wals(staging_dir, backup_info)
+
+    def _verify_staging_layout(self, staging_dir):
+        """
+        Verify that the staging directory contains the entries an exported
+        tarball is expected to provide: ``backup/``, ``backup.info``,
+        ``wals/``, and ``xlog.db``. Raises ``ImportBackupException`` with a
+        clear message naming the missing entry on the first failure.
+
+        :param str staging_dir: path to the staging directory
+        :raises ImportBackupException: if any expected entry is missing
+        """
+        # (path, is_dir) pairs in the order we want to report missing entries
+        expected = [
+            ("backup", True),
+            ("backup.info", False),
+            ("wals", True),
+            ("xlog.db", False),
+        ]
+        for path, is_dir in expected:
+            full_path = os.path.join(staging_dir, path)
+            if is_dir:
+                if not os.path.isdir(full_path):
+                    raise ImportBackupException(
+                        "Exported tarball does not contain a '%s/' directory" % path
+                    )
+            else:
+                if not os.path.isfile(full_path):
+                    raise ImportBackupException(
+                        "Exported tarball does not contain a '%s' file" % path
+                    )
+
+    def _iter_tarball_xlogdb(self, staging_dir):
+        """
+        Stream the tarball's ``xlog.db`` line by line. Yields
+        ``(stripped_line, wal_name)`` for each non-blank entry, in the
+        order the entries appear in the file (which is sorted by WAL
+        name — the export side writes via a merge-step over the server
+        catalog, so this invariant is guaranteed for any tarball produced
+        by ``barman export-backup``).
+
+        :param str staging_dir: path to the staging directory
+        :raises ImportBackupException: on I/O errors opening the file or
+            on a malformed line (with a line number)
+        """
+        path = os.path.join(staging_dir, "xlog.db")
+        try:
+            fp = open(path, "r")
+        except IOError as e:
+            raise ImportBackupException("Failed to read xlog.db from tarball: %s" % e)
+        with fp:
+            for line_num, raw_line in enumerate(fp, start=1):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    name = WalFileInfo.from_xlogdb_line(line).name
+                except ValueError as e:
+                    raise ImportBackupException(
+                        "Malformed tarball's xlog.db entry at line %d: %s"
+                        % (line_num, e)
+                    )
+                yield line, name
+
+    def _verify_staged_wals(self, staging_dir, backup_info):
+        """
+        Single-pass verification of the staged WAL set. Iterates the staging
+        ``xlog.db`` once, advancing pointers in lock-step against:
+
+        - the required WAL segments from ``backup_info`` (sorted by name)
+        - the target server's existing ``xlog.db`` (sorted by name)
+
+        For each entry in the staging ``xlog.db`` this verifies:
+
+        - it covers the next required WAL (no gap in the required range)
+        - the physical file exists in ``staging_dir/wals/<hash>/<name>``
+        - it does not collide with the server's ``xlog.db``
+        - the physical file does not collide with the server's
+          ``wals_directory`` (catches the case where xlog.db is stale)
+
+        Memory is O(1) on both ``xlog.db`` streams; only the truncated list
+        of conflict names is accumulated for error reporting.
+
+        :param str staging_dir: path to the staging directory
+        :param LocalBackupInfo backup_info: the backup info with begin/end_wal
+        :raises ImportBackupException: on missing required WALs, missing
+            physical files, malformed xlog.db, or conflicts with the target
+            server's WAL archive
+        """
+        tarball_wals_dir = os.path.join(staging_dir, "wals")
+        server_wals_dir = self.server.config.wals_directory
+
+        required_iter = iter(backup_info.get_required_wal_segments())
+        # There is no need to add a fallback value for next() here because the CLI
+        # filters for DONE backups, which are guaranteed to have at least one required
+        # WAL segment, even if begin_wal is equal to end_wal.
+        next_required = next(required_iter)
+        conflicts = []
+
+        def _next_stripped(fp):
+            line = next(fp, None)
+            return line.strip() if line is not None else None
+
+        with self.server.xlogdb("r") as server_fp:
+            server_line = _next_stripped(server_fp)
+            for tarball_line, wal_name in self._iter_tarball_xlogdb(staging_dir):
+                hash_subdir = xlog.hash_dir(wal_name)
+                tarball_wal_path = os.path.join(tarball_wals_dir, hash_subdir, wal_name)
+                server_wal_path = os.path.join(server_wals_dir, hash_subdir, wal_name)
+
+                # Required-WAL coverage: any required name strictly less
+                # than the current tarball name was skipped, so the
+                # tarball is missing it.
+                if next_required is not None and next_required < wal_name:
+                    raise ImportBackupException(
+                        "WAL file required for backup consistency not found in "
+                        "tarball's xlog.db: %s" % next_required
+                    )
+                if next_required == wal_name:
+                    if not os.path.exists(tarball_wal_path):
+                        raise ImportBackupException(
+                            "WAL file listed in tarball's xlog.db but not found "
+                            "under its wals/ directory: %s" % wal_name
+                        )
+                    next_required = next(required_iter, None)
+
+                # Advance the server xlog.db pointer past anything sorting
+                # before this WAL name, so the conflict check below sees
+                # either the matching entry or the next one beyond.
+                while (
+                    server_line is not None
+                    and WalFileInfo.from_xlogdb_line(server_line).name < wal_name
+                ):
+                    server_line = _next_stripped(server_fp)
+
+                if self._wal_conflicts_with_server(
+                    wal_name=wal_name,
+                    tarball_line=tarball_line,
+                    tarball_wal_path=tarball_wal_path,
+                    server_line=server_line,
+                    server_wal_path=server_wal_path,
+                ):
+                    conflicts.append(wal_name)
+
+        if next_required is not None:
+            raise ImportBackupException(
+                "WAL file required for backup consistency not found in tarball's "
+                "xlog.db: %s" % next_required
+            )
+        if conflicts:
+            shown = conflicts[:5]
+            msg = (
+                "WAL file(s) already exist in target server with conflicting "
+                "content: %s" % ", ".join(shown)
+            )
+            if len(conflicts) > 5:
+                msg += " (and %d more)" % (len(conflicts) - 5)
+            raise ImportBackupException(msg)
+
+    def _wal_conflicts_with_server(
+        self,
+        wal_name,
+        tarball_line,
+        tarball_wal_path,
+        server_line,
+        server_wal_path,
+    ):
+        """
+        Classify a tarball WAL against the server's current state.
+
+        Returns ``True`` if the server has this WAL in a form that
+        disagrees with the tarball — i.e., a real conflict that must
+        block the import.
+
+        Returns ``False`` for both safe cases:
+
+        - **clean import**: the server has neither the xlog.db entry nor
+          the file on disk.
+        - **idempotent re-import**: the server has both the xlog.db entry
+          and the file, AND the xlog.db metadata agrees on every field
+          except ``compression`` (see note below), AND the WAL file
+          contents are byte-equal. This legitimately happens whenever
+          the tarball contains WALs still alive in the target server's
+          catalog — for example, importing a tarball whose required WAL
+          range overlaps with WALs the server has continued to archive
+          on its own.
+
+          A WAL's on-disk form is fixed at archive time (its compression
+          and encryption mode are recorded in xlog.db and not re-applied
+          later), so a byte-equal file comparison is sufficient — no
+          decoding or decompression is required.
+
+        .. note::
+            ``compression`` is intentionally excluded from the metadata
+            comparison. ``Server.rebuild_xlogdb`` (which is also our
+            rollback mechanism — see ``_rollback_wal_import``) detects
+            file format by reading magic bytes, and for a WAL that is
+            both compressed AND encrypted, the visible outer magic is
+            the encryption magic. A rebuild therefore clears the
+            ``compression`` field that the original xlog.db had
+            recorded. Without this exception, a previously-correct
+            tarball would become non-importable any time the server's
+            xlog.db gets rebuilt between export and import. The file
+            content itself is the ground truth for "same WAL", and
+            ``filecmp.cmp`` below verifies it.
+
+        :param str wal_name: the WAL name from the tarball
+        :param str tarball_line: stripped xlog.db line from the tarball
+        :param str tarball_wal_path: path to the WAL file in the staged
+            tarball
+        :param str|None server_line: the server's xlog.db line at or after
+            ``wal_name`` (caller is responsible for advancing the pointer)
+        :param str server_wal_path: path to where this WAL would live in
+            the server's ``wals_directory``
+        :rtype: bool
+        """
+        server_has_entry = (
+            server_line is not None
+            and WalFileInfo.from_xlogdb_line(server_line).name == wal_name
+        )
+        server_has_file = os.path.exists(server_wal_path)
+
+        # Clean import: server has nothing for this WAL.
+        if not server_has_entry and not server_has_file:
+            return False
+
+        # Idempotent re-import: server has both artifacts and they match
+        # the tarball.
+        if (
+            server_has_entry
+            and server_has_file
+            and self._xlogdb_metadata_match(tarball_line, server_line)
+            and filecmp.cmp(tarball_wal_path, server_wal_path, shallow=False)
+        ):
+            return False
+
+        return True
+
+    def _xlogdb_metadata_match(self, line_a, line_b):
+        """
+        Compare two xlog.db lines for equivalence, ignoring the
+        ``compression`` field. See the ``.. note::`` in
+        :meth:`_wal_conflicts_with_server` for why ``compression`` is
+        excluded.
+
+        :param str line_a: stripped xlog.db line
+        :param str line_b: stripped xlog.db line
+        :rtype: bool
+        """
+        a = WalFileInfo.from_xlogdb_line(line_a)
+        b = WalFileInfo.from_xlogdb_line(line_b)
+        return (a.name, a.size, a.time, a.encryption) == (
+            b.name,
+            b.size,
+            b.time,
+            b.encryption,
+        )
+
+    def _import_backup_wals(self, staging_dir):
+        """
+        Import WAL files from the staging directory into the server's WAL
+        archive and merge xlog.db entries into the server's WAL catalog.
+
+        Uses a streaming merge-step to combine import entries with the
+        existing xlog.db without loading the entire file into memory.
+        Operates under the server's xlog.db lock to prevent concurrent
+        modifications. Returns a rollback callable that will undo all changes
+        (remove imported WAL files and rebuild xlog.db to a consistent state
+        derived from the on-disk WAL archive) if a later step in the import
+        process fails.
+
+        :param str staging_dir: path to the staging directory
+        :return: a callable that rolls back all WAL import side effects
+        :rtype: callable
+        :raises ImportBackupException: if WAL import fails
+        """
+        tarball_wals_dir = os.path.join(staging_dir, "wals")
+        server_wals_dir = self.server.config.wals_directory
+        server_xlogdb_dir = os.path.dirname(self.server.xlogdb_file_path)
+
+        moved_files = []
+        created_dirs = []
+
+        def _move_tarball_wal(wal_name):
+            """Move a single tarball WAL into the server's wals_directory
+            and record the move for the rollback closure."""
+            hash_subdir = xlog.hash_dir(wal_name)
+            server_hash_dir = os.path.join(server_wals_dir, hash_subdir)
+            if not os.path.exists(server_hash_dir):
+                os.makedirs(server_hash_dir)
+                created_dirs.append(server_hash_dir)
+            tarball_wal_path = os.path.join(tarball_wals_dir, hash_subdir, wal_name)
+            server_wal_path = os.path.join(server_hash_dir, wal_name)
+            shutil.move(tarball_wal_path, server_wal_path)
+            moved_files.append(server_wal_path)
+
+        def _next_tarball_entry(iter_):
+            """Advance the tarball xlog.db iterator, returning
+            ``(None, None)`` at exhaustion so the merge-step below can
+            test ``tarball_name is None`` instead of catching
+            ``StopIteration``."""
+            return next(iter_, (None, None))
+
+        try:
+            # Single-pass merge of the tarball into the server catalog.
+            # Both xlog.db streams are sorted by WAL name (fixed-width
+            # hex), so the merge runs in O(1) extra memory. For each
+            # tarball entry not present in the server we move its WAL
+            # file into the server's wals_directory and write its
+            # xlog.db line into a scratch tmp file. For each tarball
+            # entry that DOES match a server entry, ``_verify_staged_wals``
+            # has already guaranteed the entry is bit-identical to the
+            # server's (idempotent re-import), so the move is skipped —
+            # the file is already in place — and the line is emitted
+            # from the server side, not duplicated from the tarball.
+            # When the merged tmp file is complete it is copied back
+            # into the live xlog.db.
+            with self.server.xlogdb("r+") as server_fp:
+                with tempfile.TemporaryFile(mode="w+", dir=server_xlogdb_dir) as tmp:
+                    tarball_iter = self._iter_tarball_xlogdb(staging_dir)
+                    tarball_line, tarball_name = _next_tarball_entry(tarball_iter)
+
+                    for raw_server_line in server_fp:
+                        server_line = raw_server_line.strip()
+                        if not server_line:
+                            continue
+                        server_name = WalFileInfo.from_xlogdb_line(server_line).name
+
+                        # Tarball entries strictly before this server
+                        # entry: real new imports — move + emit.
+                        while tarball_name is not None and tarball_name < server_name:
+                            _move_tarball_wal(tarball_name)
+                            tmp.write(tarball_line + "\n")
+                            tarball_line, tarball_name = _next_tarball_entry(
+                                tarball_iter
+                            )
+
+                        # Same name on both sides: idempotent re-import,
+                        # advance the tarball iterator without moving or
+                        # emitting (the server's line covers it).
+                        if tarball_name == server_name:
+                            tarball_line, tarball_name = _next_tarball_entry(
+                                tarball_iter
+                            )
+
+                        tmp.write(server_line + "\n")
+
+                    # Drain any tarball entries beyond the end of the
+                    # server xlog.db: all real new imports.
+                    while tarball_name is not None:
+                        _move_tarball_wal(tarball_name)
+                        tmp.write(tarball_line + "\n")
+                        tarball_line, tarball_name = _next_tarball_entry(tarball_iter)
+
+                    tmp.flush()
+                    tmp.seek(0)
+                    server_fp.seek(0)
+                    shutil.copyfileobj(tmp, server_fp)
+                    server_fp.truncate()
+
+            output.debug("Successfully imported %d WAL files" % len(moved_files))
+
+        except Exception as e:
+            # Roll back: remove moved WAL files and rebuild xlog.db
+            self._rollback_wal_import(moved_files, created_dirs)
+            if isinstance(e, ImportBackupException):
+                raise
+            raise ImportBackupException("Failed to import WAL files: %s" % e)
+
+        # Build and return a rollback closure for the caller to invoke
+        # if a later step (e.g. metadata registration) fails
+        def rollback():
+            self._rollback_wal_import(moved_files, created_dirs)
+
+        return rollback
+
+    def _rollback_wal_import(self, moved_files, created_dirs):
+        """
+        Undo WAL import side effects: remove moved WAL files, remove
+        newly-created empty hash directories, and rebuild xlog.db from
+        the WAL archive on disk.
+
+        :param list moved_files: list of WAL file paths that were moved
+        :param list created_dirs: list of hash directories that were created
+        """
+        # Remove moved WAL files
+        for filepath in moved_files:
+            try:
+                if os.path.exists(filepath):
+                    os.unlink(filepath)
+            except OSError:
+                _logger.warning("Rollback: failed to remove WAL file '%s'" % filepath)
+
+        # Remove newly-created empty hash directories
+        for dirpath in created_dirs:
+            try:
+                if os.path.isdir(dirpath) and not os.listdir(dirpath):
+                    os.rmdir(dirpath)
+            except OSError:
+                _logger.warning("Rollback: failed to remove directory '%s'" % dirpath)
+
+        # Rebuild xlog.db from the WAL files actually on disk, which now
+        # excludes the removed imports, restoring the pre-import state.
+        self.server.rebuild_xlogdb(silent=True)
+
+    def _import_backup_data(self, staging_dir, backup_info):
+        """
+        Move backup data from the staging directory to the target backup
+        location. Assumes the pre-flight in :meth:`import_backup` has
+        already verified that ``backup/`` exists in the staging dir.
+
+        :param str staging_dir: path to the staging directory
+        :param LocalBackupInfo backup_info: the backup info object whose
+            ``get_basebackup_directory()`` provides the target path
+        :raises ImportBackupException: if the data move fails
+        """
+        source_dir = os.path.join(staging_dir, "backup")
+        target_dir = backup_info.get_basebackup_directory()
+
+        try:
+            os.rename(source_dir, target_dir)
+        except OSError as e:
+            raise ImportBackupException(
+                "Failed to move backup data to '%s': %s" % (target_dir, e)
+            )
 
     def get_wal_file_info(self, filename):
         """

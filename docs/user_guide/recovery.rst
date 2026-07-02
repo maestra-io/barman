@@ -185,6 +185,57 @@ command.
   When using ``--no-get-wal`` with targets like ``--target-xid``, ``--target-name``, or 
   ``--target-time``, Barman will copy the entire WAL archive to ensure availability.
 
+.. _recovery-partial-wal-files:
+
+Partial WAL files during recovery
+""""""""""""""""""""""""""""""""""
+
+When using ``--no-get-wal``, Barman can optionally copy ``.partial`` WAL files to the
+recovery destination by specifying the ``--partial-wal`` flag. A ``.partial`` WAL file
+is a WAL segment that has been partially written by Postgres but not yet completed and
+archived.
+
+.. code-block:: text
+
+  barman restore SERVER_NAME BACKUP_ID DESTINATION_PATH --no-get-wal --partial-wal
+
+Including ``.partial`` files in the recovery reduces the RPO (Recovery Point Objective)
+by ensuring that any transactions written since the last completed WAL segment are
+available during recovery.
+
+.. note::
+  When using ``--get-wal``, ``.partial`` files are already handled transparently
+  during recovery — ``barman-wal-restore`` (remote) and ``barman get-wal`` (local)
+  both support ``.partial`` files natively and do not require the ``--partial-wal``
+  flag.
+
+Barman considers ``.partial`` files from two sources:
+
+* **Streaming WALs directory** (``streaming_wals_directory``): the file being
+  actively written by ``pg_receivewal``. Only the segment immediately following the
+  last archived WAL is considered; any other ``.partial`` files in the directory are
+  ignored. This guarantees continuity between the archived WALs and the partial
+  segment. Files from this source are always plain and require no decompression or
+  decryption.
+* **Main WAL archive** (``wals/``): ``.partial`` files archived with the suffix
+  intact — typically when a standby is promoted and PostgreSQL calls
+  ``archive_command`` with the in-progress segment. These files are yielded as part
+  of the normal WAL range required for recovery. If ``barman cron`` has compressed or
+  encrypted them, they are decompressed and/or decrypted before being written to the
+  destination.
+
+The following additional rules apply to both sources:
+
+* ``.partial`` files on a different timeline are automatically excluded because the
+  expected segment name encodes the target timeline.
+* When ``--target-lsn`` is used, only a ``.partial`` file whose segment name is less
+  than or equal to the WAL segment containing the target LSN is included; any segment
+  beyond that point is skipped.
+* When ``--target-immediate`` is used, ``.partial`` files are skipped entirely since
+  recovery stops at the first consistent state.
+* The ``.partial`` suffix is stripped from all filenames in the recovery destination
+  so that PostgreSQL can locate them by their plain segment name.
+
 Another option is to include ``get-wal`` inside the ``recovery_options`` configuration
 at the global/server level prior to a recovery operation to retrieve WAL files during
 the recovery process without the need to specifying the ``--get-wal``, effectively
@@ -289,6 +340,33 @@ the :ref:`commands-barman-cli-barman-wal-restore` command reference.
   removing the original. Be mindful of the filesystem locations to optimize WAL file
   management efficiency.
 
+
+.. _recovery-recovering-cloud-wal-restore:
+
+Using ``cloud-wal-restore`` for cloud recovery
+""""""""""""""""""""""""""""""""""""""""""""""
+
+When restoring from a cloud backup, whether taken with ``backup_method = local-to-cloud``
+or ``backup_method = postgres``, ``barman cloud-wal-restore`` can be used as the
+``restore_command`` to retrieve WAL files directly from the configured cloud provider,
+bypassing the Barman server.
+
+.. note::
+
+  Restoring a cloud backup in ``--no-get-wal`` mode (default) is not supported. Hence,
+  the only way to restore WALs stored in the cloud is by using ``cloud-wal-restore``
+  as the ``restore_command``. An attempt to use ``--no-get-wal`` in ``barman restore``
+  for a cloud backup will be ignored and warned.
+
+An example of a ``restore_command`` for cloud recovery is as follows:
+
+.. code-block:: text
+
+  restore_command = 'barman cloud-wal-restore --parallel 5 SERVER_NAME %f %p'
+
+It goes without saying that ``wals_directory`` must point to the cloud location where
+WAL files are stored, e.g., ``wals_directory = s3://barman/wals``.
+
 .. _recovery-recovering-encrypted-backups:
 
 Recovering Encrypted Backups
@@ -388,13 +466,6 @@ The process involves a few steps:
 3. When additional operations are required, the staging directory is removed after the
    subsequent operation have finished.
 
-Since Barman does not have knowledge of the deployment environment, it depends on the
-``staging_path`` and ``staging_location`` options to determine an appropriate location
-for the staging directory. Set the option in the global/server configuration or use the
-``--staging-path`` and ``--staging-location`` options with the ``barman restore``
-command. Failing to do so will result in an error, as Barman cannot guess a suitable
-location on its own.
-
 .. _recovery-recovering-block-level-incremental-backups:
 
 Recovering block-level incremental Backups
@@ -402,13 +473,7 @@ Recovering block-level incremental Backups
 
 If you are recovering from a block-level incremental backup, Barman combines the backup
 chain using ``pg_combinebackup``. This chain consists of the root backup and all
-subsequent incremental backups up to the one being recovered. 
-
-To successfully recover from a block-level incremental backup, you must specify the
-``staging_path`` and ``staging_location`` options in the global/server configuration or
-use the equivalent ``--staging-path`` and ``--staging-location`` options with the
-``barman restore`` command. Failing to do so will result in an error, as Barman cannot
-automatically determine a suitable staging location.
+subsequent incremental backups up to the one being recovered.
 
 The process involves the following steps:
 
@@ -522,6 +587,78 @@ the order differs slightly: the rsync copy is deferred to the end. The combine o
 uses its own ``staging_path``, and the final step is to transfer the synthetic backup to
 the restore destination on the remote node.
 
+.. _recovering-backups-from-the-cloud:
+
+Recovering Backups from the Cloud
+---------------------------------
+
+Restoring a cloud backup, whether taken with ``backup_method = local-to-cloud``
+or ``backup_method = postgres``, follows the same process as restoring a local backup: a
+simple ``barman restore`` command. The main difference is that it offers some
+alternative restore flows, as described in the following sections.
+
+For cloud WAL restore, check the :ref:`recovery-recovering-cloud-wal-restore` section.
+
+.. _recovery-restoring-cloud-backups-setting-a-new-server:
+
+Restoring Cloud Backups on a New Server
+"""""""""""""""""""""""""""""""""""""""
+
+The most efficient way to restore a cloud backup is to pull it directly to where your
+cluster will run, bypassing any centralized Barman server. To do this, run
+``barman restore`` directly on the destination host where your cluster is going to be
+started.
+
+In this approach, a Barman instance is installed and configured with the only purpose
+of restoring a cloud backup, being inactive for any other task. A minimal configuration
+for this Barman instance could look like the following:
+
+.. code-block:: ini
+
+  [pg]
+  description = "Minimal configuration for cloud backup restore"
+  wals_directory = s3://barman/backups
+  basebackups_directory = s3://barman/backups
+  active = off
+
+.. note::
+  ``basebackups_directory`` and ``wals_directory`` must point to an existing cloud
+  location where your backups and WAL files are stored, respectively.
+
+.. important::
+  You MUST set ``active = off`` to prevent this Barman instance from running maintenance
+  tasks that could interfere with your data. Without this setting, Barman refuses to
+  search for any backups in the cloud.
+
+.. _recovery-restoring-cloud-backups-from-barman-server:
+
+Restoring Cloud Backups from the same Barman Server
+"""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The easiest way to restore a cloud backup is by triggering the restore from the same
+Barman server that triggered the backup. This approach is as straightforward as running:
+
+.. code-block:: bash
+
+  barman restore SERVER_NAME BACKUP_ID /path/to/destination
+
+Naturally, this is only useful if you want to start your cluster on the same host where
+the Barman instance that triggered the backup is installed.
+
+To restore it to a different host, you can use the ``--remote-ssh-command`` option and
+perform a remote copy via SSH:
+
+.. code-block:: bash
+
+  barman restore SERVER_NAME BACKUP_ID /path/to/destination --remote-ssh-command "ssh postgres@target-server"
+
+.. warning::
+
+  This approach routes backup data through the Barman server: the backup is first
+  pulled from the cloud to the Barman host and then transferred to the target host.
+  This can lead to increased restore times and higher bandwidth usage on the Barman
+  server.
+
 .. _recovery-limitation-of-partial-wal-files:
 
 Limitations of .partial WAL files
@@ -549,14 +686,9 @@ handle the ``.partial`` file.
 Moreover, ``get-wal`` will check the ``incoming`` directory for any WAL files that have
 been sent to Barman but not yet archived.
 
-If recovering with ``no-get-wal``, Barman will copy all archived WALs to the destination
-node. In this case, the partial WAL file will not be copied, with the eventual lost data
-from transactions recorded in the partial file.
-
-To avoid such limitation, you can copy the partial WAL file located in the
-``streaming_wals_directory`` to the
-:ref:`staging wal directory <commands-barman-restore-staging-wal-directory>` on the
-destination node, renaming it without the `.partial` suffix.
+If recovering with ``--no-get-wal``, Barman will copy all archived WALs to the
+destination node. To also recover transactions recorded in a ``.partial`` WAL segment,
+use the ``--partial-wal`` flag. See :ref:`recovery-partial-wal-files` for details.
 
 
 .. _recovery-managing-external-configuration-files:

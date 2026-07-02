@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import sys
+import tarfile
 from argparse import SUPPRESS, ArgumentParser, ArgumentTypeError, HelpFormatter
 from collections import OrderedDict
 from contextlib import closing
@@ -35,6 +36,7 @@ import barman.utils
 from barman import output
 from barman.annotations import KeepManager
 from barman.backup_manifest import BackupManifest
+from barman.cloud import CloudWalDownloader
 from barman.config import (
     ConfigChangesProcessor,
     RecoveryOptions,
@@ -908,6 +910,14 @@ def rebuild_xlogdb(args):
             default=SUPPRESS,
         ),
         argument(
+            "--partial-wal",
+            help="Copy .partial WAL files, if any, to the recovery destination. Only "
+            "applicable when --no-get-wal is used.",
+            dest="partial_wal",
+            action="store_true",
+            default=False,
+        ),
+        argument(
             "--network-compression",
             help="Enable network compression during remote recovery.",
             dest="network_compression",
@@ -1068,16 +1078,6 @@ def restore(args):
         disabled_is_error=True,
     )
 
-    if server.use_backup_cloud_storage or server.use_wal_cloud_storage:
-        output.error(
-            "Cannot restore backup %s of server '%s' because it is configured with a "
-            "cloud storage. Restoring a backup stored in a cloud environment is "
-            "currently not supported",
-            args.backup_id,
-            server.config.name,
-        )
-        output.close_and_exit()
-
     # PostgreSQL supports multiple parameters to specify when the recovery
     # process will end, and in that case the last entry in recovery
     # configuration files will be used. See [1]
@@ -1203,6 +1203,7 @@ def restore(args):
                 backup_info.is_incremental,
                 backup_info.compression,
                 backup_info.encryption,
+                server.use_backup_cloud_storage,
             ]
         )
         and not server.config.staging_path
@@ -1320,6 +1321,15 @@ def restore(args):
             server.config.recovery_options.add(RecoveryOptions.GET_WAL)
         elif RecoveryOptions.GET_WAL in server.config.recovery_options:
             server.config.recovery_options.remove(RecoveryOptions.GET_WAL)
+    if (
+        server.use_wal_cloud_storage
+        and RecoveryOptions.GET_WAL not in server.config.recovery_options
+    ):
+        output.warning(
+            "get-wal is required for servers with WALs stored in cloud storage. "
+            "Automatically enabling --get-wal."
+        )
+        server.config.recovery_options.add(RecoveryOptions.GET_WAL)
     if args.jobs is not None:
         server.config.parallel_jobs = args.jobs
     if args.jobs_start_batch_size is not None:
@@ -1443,6 +1453,7 @@ def restore(args):
                 recovery_conf_filename=args.recovery_conf_filename,
                 recovery_option_port=args.recovery_option_port,
                 custom_restore_command=args.restore_command,
+                copy_partial=args.partial_wal,
                 **snapshot_kwargs,
             )
         except RecoveryException as exc:
@@ -2159,6 +2170,221 @@ def verify_backup(args):
         argument(
             "server_name",
             completer=server_completer,
+            help="specifies the server name for the command",
+        ),
+        argument(
+            "backup_id",
+            completer=backup_completer,
+            help="specifies the backup ID to export",
+        ),
+        argument(
+            "output_directory",
+            help="directory where the exported tarball will be saved",
+        ),
+        argument(
+            "--compression",
+            choices=["gzip", "bzip2", "xz"],
+            default=None,
+            help="if specified, compress the exported tarball using the given "
+            "algorithm (default: no compression)",
+        ),
+        argument(
+            "--compression-level",
+            type=int,
+            default=None,
+            dest="compression_level",
+            help="compression level for the specified algorithm, if any. "
+            "Valid levels are 1-9 for gzip/bzip2, 0-9 for xz (default: algorithm "
+            "default level)",
+        ),
+    ],
+)
+def export_backup(args):
+    """
+    Export a backup for the given server and backup ID to a tarball.
+    """
+    # Get server
+    server = get_server(
+        args,
+        skip_inactive=False,
+        skip_disabled=False,
+        inactive_is_error=False,
+        disabled_is_error=True,
+    )
+
+    # Parse backup ID and validate backup exists
+    backup_info = parse_backup_id(server, args)
+
+    # Get output directory from CLI
+    output_directory = args.output_directory
+
+    # Refuse incremental backups: a block-level incremental backup is only
+    # meaningful as part of its parent chain, so an exported tarball of a
+    # single incremental backup cannot be cleanly restored standalone.
+    if backup_info.is_incremental:
+        output.error(
+            "Cannot export backup %s from server %s: it is an incremental backup.\n"
+            "Only full backups are eligible for exporting."
+            % (backup_info.backup_id, server.config.name)
+        )
+        output.close_and_exit()
+
+    # Validate backup status is DONE
+    if backup_info.status != BackupInfo.DONE:
+        output.error(
+            "Cannot export backup '%s' from server '%s': backup status is '%s', expected 'DONE'",
+            args.backup_id,
+            server.config.name,
+            backup_info.status,
+        )
+        output.close_and_exit()
+
+    # Validate output directory exists and is writable
+    if not os.path.exists(output_directory):
+        output.error(
+            "Output directory '%s' does not exist",
+            output_directory,
+        )
+        output.close_and_exit()
+
+    if not os.path.isdir(output_directory):
+        output.error(
+            "Output directory '%s' is not a directory",
+            output_directory,
+        )
+        output.close_and_exit()
+
+    if not os.access(output_directory, os.W_OK | os.X_OK):
+        output.error(
+            "Output directory '%s' does not have the required write and execute permissions",
+            output_directory,
+        )
+        output.close_and_exit()
+
+    # Validate compression options
+    compression = args.compression
+    compression_level = args.compression_level
+
+    if compression is None and compression_level is not None:
+        output.error("--compression-level requires --compression to be set")
+        output.close_and_exit()
+
+    if compression_level is not None:
+        if compression == "xz":
+            valid_levels = range(0, 10)
+        else:
+            valid_levels = range(1, 10)
+
+        if compression_level not in valid_levels:
+            output.error(
+                "Invalid compression level '%s' for algorithm '%s'. "
+                "Valid levels are: %s",
+                compression_level,
+                compression,
+                ", ".join(str(level) for level in valid_levels),
+            )
+            output.close_and_exit()
+
+    # Log the export operation
+    output.info(
+        "Exporting backup '%s' from server '%s' to '%s'",
+        args.backup_id,
+        server.config.name,
+        output_directory,
+    )
+
+    # Delegate to server for orchestration
+    with closing(server):
+        server.export_backup(
+            backup_info,
+            output_directory,
+            compression=compression,
+            compression_level=compression_level,
+        )
+
+    output.close_and_exit()
+
+
+@command(
+    [
+        argument(
+            "server_name",
+            completer=server_completer,
+            help="specifies the server name for the command",
+        ),
+        argument(
+            "input_tarball",
+            help="path to the exported backup tarball to import",
+        ),
+    ],
+)
+def import_backup(args):
+    """
+    Import a previously exported backup tarball into the Barman catalog.
+    """
+    # Get server
+    server = get_server(
+        args,
+        skip_inactive=False,
+        skip_disabled=False,
+        inactive_is_error=False,
+        disabled_is_error=True,
+    )
+
+    # Get tarball path from CLI
+    input_tarball = args.input_tarball
+
+    # Validate tarball file exists
+    if not os.path.exists(input_tarball):
+        output.error(
+            "Tarball file '%s' does not exist",
+            input_tarball,
+        )
+        output.close_and_exit()
+
+    # Validate tarball is a file (not a directory)
+    if not os.path.isfile(input_tarball):
+        output.error(
+            "Tarball path '%s' is not a file",
+            input_tarball,
+        )
+        output.close_and_exit()
+
+    # Validate tarball is readable
+    if not os.access(input_tarball, os.R_OK):
+        output.error(
+            "Tarball file '%s' is not readable",
+            input_tarball,
+        )
+        output.close_and_exit()
+
+    # Validate tarball is a valid tar file
+    if not tarfile.is_tarfile(input_tarball):
+        output.error(
+            "File '%s' is not a valid tar file",
+            input_tarball,
+        )
+        output.close_and_exit()
+
+    # Log the import operation
+    output.info(
+        "Importing backup from '%s' to server '%s'",
+        input_tarball,
+        server.config.name,
+    )
+
+    # Delegate to server for orchestration
+    with closing(server):
+        server.import_backup(input_tarball)
+
+    output.close_and_exit()
+
+
+@command(
+    [
+        argument(
+            "server_name",
+            completer=server_completer,
             help="specifies the server name for the command ",
         ),
         argument(
@@ -2400,6 +2626,16 @@ def config_update(args):
             "wal_path",
             help="the value of the '%%p' keyword (according to 'archive_command').",
         ),
+        argument(
+            "-p",
+            "--parallel",
+            default=None,
+            type=int,
+            help="Specifies the maximum number of WALs to archive in parallel. "
+            "Defaults to the server configuration value "
+            "(cloud_wal_archive_parallel), which itself defaults to 0 "
+            "(disabled).",
+        ),
     ]
 )
 def cloud_wal_archive(args):
@@ -2427,8 +2663,74 @@ def cloud_wal_archive(args):
         skip_passive=True,
     )
 
+    if args.parallel is not None:
+        server.config.cloud_wal_archive_parallel = args.parallel
+
     with closing(server):
-        server.cloud_wal_archive(args.wal_path)
+        server.cloud_wal_archive(
+            args.wal_path,
+            server.config.cloud_wal_archive_parallel,
+        )
+
+    output.close_and_exit()
+
+
+@command(
+    [
+        argument(
+            "server_name",
+            completer=server_completer,
+            help="specifies the server name for the command",
+        ),
+        argument(
+            "wal_name",
+            help="The value of the '%%f' keyword (according to 'restore_command')",
+        ),
+        argument(
+            "wal_dest",
+            help="The value of the '%%p' keyword (according to 'restore_command')",
+        ),
+        argument(
+            "-p",
+            "--parallel",
+            default=None,
+            type=int,
+            help="Specifies the number of files to peek and download in parallel. "
+            "Default is 0 (disabled)",
+        ),
+        argument(
+            "--spool-dir",
+            default=CloudWalDownloader.DEFAULT_SPOOL_DIR,
+            metavar="SPOOL_DIR",
+            help="Specifies a spool directory for extra WAL files that are downloaded in "
+            "parallel. Defaults to '{0}'.".format(CloudWalDownloader.DEFAULT_SPOOL_DIR),
+        ),
+    ]
+)
+def cloud_wal_restore(args):
+    """
+    Pull a WAL file from a configured cloud object storage to the local disk.
+
+    This command is intended to be used as 'restore_command' in Postgres when restoring
+    WALs from a cloud object storage.
+    """
+    if not is_any_xlog_file(args.wal_name):
+        output.error(f"File is not a valid WAL file: {args.wal_name}")
+        output.close_and_exit()
+
+    server = get_server(
+        args,
+        skip_inactive=False,
+        skip_disabled=False,
+        inactive_is_error=False,
+        disabled_is_error=True,
+    )
+
+    if args.parallel is not None:
+        server.config.cloud_wal_restore_parallel = args.parallel
+
+    with closing(server):
+        server.cloud_wal_restore(args.wal_name, args.wal_dest, args.spool_dir)
 
     output.close_and_exit()
 

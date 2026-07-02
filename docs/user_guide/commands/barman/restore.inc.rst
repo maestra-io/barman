@@ -22,6 +22,7 @@ Synopsis
         [ --local-staging-path PATH ]
         [ { --network-compression | --no-network-compression } ]
         [ --no-retry ]
+        [ --partial-wal ]
         [ --recovery-conf-filename FILENAME ]
         [ --recovery-staging-path PATH ]
         [ --staging-path STAGING_PATH ]
@@ -98,6 +99,24 @@ Parameters
 ``--get-wal`` / ``--no-get-wal``
     Enable/disable usage of ``get-wal`` for WAL fetching during recovery. Default is based on
     ``recovery_options`` setting.
+
+    .. note::
+        When ``wals_directory`` is configured to use cloud storage (e.g. S3, Azure,
+        GCS), restores always require ``get-wal`` for WAL fetching. If you specify
+        ``--no-get-wal`` or omit ``get-wal`` from ``recovery_options``, Barman will
+        automatically enable ``get-wal`` for the restore operation and issue a
+        warning.
+
+``--partial-wal``
+    Copy ``.partial`` WAL files to the recovery destination with the ``.partial``
+    suffix stripped. Barman considers two sources: ``.partial`` files in the
+    ``streaming_wals_directory`` (written by ``pg_receivewal``) and ``.partial``
+    files in the main WAL archive (archived during standby promotion, possibly
+    compressed or encrypted). Only applicable when using ``--no-get-wal``. When
+    ``--get-wal`` is used, ``.partial`` files are already handled transparently and
+    this option has no effect. The flag also has no effect when ``--target-immediate``
+    is used, since recovery stops at the first consistent state before any partial WAL
+    would be needed. See :ref:`recovery-partial-wal-files` for details.
 
 ``-h`` / ``--help``
     Show a help message and exit. Provides information about command usage.

@@ -148,6 +148,17 @@ safely stored in the cloud.
   same path, for both options. This ensures a consistent storage structure in the cloud
   as Barman organizes data of each server in dedicated subdirectories.
 
+.. warning::
+  Changing the value of ``basebackups_directory`` and/or ``wals_directory`` on an
+  active server is discouraged. Even if done with care, by deactivating the server,
+  moving existing data to the new location, and reactivating it, there are potential
+  risks of data loss or misconfiguration.
+
+  Instead, the safe option is to create a new server configuration with the new value
+  for ``basebackups_directory`` or ``wals_directory``, perform a new full backup to the
+  new server, and then decommission the old server once the new one is fully
+  operational.
+
 When using this feature, Barman requires a local staging space to process chunks before
 uploading them to the cloud. The amount of staging space allowed to be used as well as
 its location can be configured with the options ``cloud_staging_max_size`` and
@@ -156,19 +167,16 @@ its location can be configured with the options ``cloud_staging_max_size`` and
 
 This is an experimental feature. For this reason, a few limitations apply:
 
-1. Restoring backups taken with this method is currently not supported directly in
-   Barman, and it's the user's responsibility to perform this manually or through
-   custom scripts/processes. Restoring such backups will come in a future release;
-2. Currently, only S3-compatible storages are supported as destination;
-3. Encryption of backups and WALs is not supported;
-4. Compression of backups is not supported. WAL compression is supported except when
+1. Currently, only S3-compatible storages are supported as destination;
+2. Encryption of backups and WALs is not supported;
+3. Compression of backups is not supported. WAL compression is supported except when
    using ``pigz`` or ``custom`` as compression methods;
-5. Barman subcommands which require access to the backup or WAL files, such as
+4. Barman subcommands which require access to the backup or WAL files, such as
    ``verify-backup``, ``generate-manifest``, ``rebuild-xlogdb`` and ``get-wal``, are
    not supported and will fail if executed;
-6. The Barman :ref:`geographical-redundancy` feature and its related commands are not
+5. The Barman :ref:`geographical-redundancy` feature and its related commands are not
    supported.
-7. For now this feature works only on Linux-based distributions and is not
+6. For now this feature works only on Linux-based distributions and is not
    supported on BSD-derived systems (such as FreeBSD or OpenBSD).
 
 
@@ -180,8 +188,8 @@ Rsync Backups
 Barman can perform a backup of a Postgres server using Rsync, which uses SSH as a
 transport mechanism.
 
-To configure a backup using rsync, include the following parameters in the Barman server
-configuration file:
+To configure a backup using rsync, include the following parameters in the Barman
+configuration file for the specific Postgres server:
 
 .. code-block:: text
 
@@ -315,11 +323,6 @@ as it is read from disk.
     * Network access to a properly configured S3 or S3-compatible object storage
       bucket.
 
-.. important::
-    **Recovery functionality for the local-to-cloud method is not yet implemented**.
-    Support for restoring backups taken with this method will be introduced in a future
-    version of Barman.
-
 To configure local-to-cloud backups, set the ``backup_method`` to ``local-to-cloud`` and
 configure cloud storage path URLs:
 
@@ -337,6 +340,17 @@ Similarly, ``wals_directory`` should point to an S3 storage location for WAL arc
     It's recommended to use the same bucket and path for both ``basebackups_directory``
     and ``wals_directory`` to maintain a consistent storage structure in the cloud, as
     Barman organizes data of each server in dedicated subdirectories.
+
+.. warning::
+  Changing the value of ``basebackups_directory`` and/or ``wals_directory`` on an
+  active server is discouraged. Even if done with care, by deactivating the server,
+  moving existing data to the new location, and reactivating it, there are potential
+  risks of data loss or misconfiguration.
+
+  Instead, the safe option is to create a new server configuration with the new value
+  for ``basebackups_directory`` or ``wals_directory``, perform a new full backup to the
+  new server, and then decommission the old server once the new one is fully
+  operational.
 
 
 AWS S3 Configuration Options
@@ -397,7 +411,6 @@ The ``local-to-cloud`` backup method has the following limitations:
   and Google Cloud Storage support will be added in future versions.
 * It requires local filesystem access to PGDATA (unlike ``rsync`` or ``postgres``
   methods for remote servers).
-* Recovery is currently not implemented and will be available in a future version.
 
 Example Configuration
 ^^^^^^^^^^^^^^^^^^^^^
@@ -432,6 +445,18 @@ using the `barman cloud-wal-archive` command, which uploads WAL files via the
 .. code-block:: text
 
     archive_command = 'barman cloud-wal-archive myserver %p'
+
+To reduce WAL archival backlog during periods of high WAL generation, the ``--parallel``
+flag (or the ``cloud_wal_archive_parallel`` configuration option) can be used to upload
+additional WAL files concurrently:
+
+.. code-block:: text
+
+    archive_command = 'barman cloud-wal-archive --parallel 2 myserver %p'
+
+When ``--parallel N`` is set (N > 1), up to ``N - 1`` extra WAL files that are ready
+in ``pg_wal/archive_status`` are uploaded in background processes after the primary WAL
+has been successfully archived.
 
 
 General Backup Settings

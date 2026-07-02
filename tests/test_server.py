@@ -42,6 +42,7 @@ from barman.config import BackupOptions
 from barman.exceptions import (
     CommandFailedException,
     LockFileBusy,
+    LockFileException,
     LockFilePermissionDenied,
     PostgresDuplicateReplicationSlot,
     PostgresInvalidReplicationSlot,
@@ -252,22 +253,33 @@ class TestServer(object):
 
     @patch("barman.server.os.makedirs", wraps=os.makedirs)
     def test_make_directories(self, mock_makedirs, tmpdir):
-        # GIVEN a server with wals_directory and basebackups_directory config options
+        # GIVEN a server with wals_directory, basebackups_directory, and
+        # incoming_wals_directory config options, plus a real backup_directory
+        # so that meta_directory resolves to a concrete path
         server = build_real_server()
         wals_dir = tmpdir.mkdir("wals").strpath  # existing dir
         incoming_dir = tmpdir.join("incoming").strpath  # non-existing dir
         basebackups_dir = "s3://mybucket/basebackups"  # URL, should be ignored
+        backup_dir = tmpdir.strpath
         server.config = mock.MagicMock(
             KEYS=["wals_directory", "basebackups_directory", "incoming_wals_directory"],
             wals_directory=wals_dir,
             incoming_wals_directory=incoming_dir,
             basebackups_directory=basebackups_dir,
+            backup_directory=backup_dir,
         )
+        # Reset the mock to ignore any makedirs calls made during server initialization
+        mock_makedirs.reset_mock()
         # WHEN _make_directories is called
         server._make_directories()
-        # THEN only the non-existing path is created, the existing and URL are skipped
+        # THEN the non-existing config dir and the meta directory are created;
+        # the existing dir and the URL are skipped
+        meta_dir = os.path.join(backup_dir, "meta")
         assert os.path.exists(incoming_dir)
-        mock_makedirs.assert_called_once_with(incoming_dir)
+        assert os.path.exists(meta_dir)
+        mock_makedirs.assert_any_call(incoming_dir, exist_ok=True)
+        mock_makedirs.assert_any_call(meta_dir, exist_ok=True)
+        assert mock_makedirs.call_count == 2
 
     @patch("barman.server.os")
     def test_xlogdb_with_exception(self, os_mock, tmpdir):
@@ -455,12 +467,78 @@ class TestServer(object):
     def test_rebuild_xlogdb_not_supported_using_cloud(
         self, _mock_wal_cloud, mock_output, mock_exists
     ):
-        """Test rebuilding the xlogdb when compression is enabled"""
+        """Test rebuilding the xlogdb when using cloud storage"""
         server = build_real_server()
         server.rebuild_xlogdb()
         mock_output.error.assert_called_once_with(
             "Rebuilding xlogdb is not supported for servers using cloud storage"
         )
+
+    @patch("barman.server.os.path.exists", return_value=True)
+    @patch("barman.server.output")
+    @patch("barman.server.Server.use_wal_cloud_storage", new_callable=lambda: True)
+    def test_rebuild_xlogdb_cloud_silent_no_error(
+        self, _mock_wal_cloud, mock_output, mock_exists
+    ):
+        """
+        Test that rebuild_xlogdb with silent=True on a cloud storage server
+        returns without emitting an error.
+
+        When xlogdb() calls rebuild_xlogdb(silent=True) to bootstrap an empty
+        xlog.db, the unsupported-cloud error must be suppressed — otherwise
+        any command (e.g. list-backups) on a new cloud server would confuse
+        users with an error about rebuild-xlogdb.
+        """
+        # GIVEN a server using cloud WAL storage
+        server = build_real_server()
+        # WHEN rebuild_xlogdb is called silently
+        server.rebuild_xlogdb(silent=True)
+        # THEN no error is emitted
+        mock_output.error.assert_not_called()
+
+    @patch("barman.server.output")
+    @patch("barman.server.Server.use_wal_cloud_storage", new_callable=lambda: True)
+    def test_xlogdb_cloud_no_error_when_xlogdb_missing(
+        self, _mock_wal_cloud, mock_output, tmpdir
+    ):
+        """
+        Test that opening xlogdb() on a cloud storage server when xlog.db does
+        not exist yet does not emit the rebuild-xlogdb error.
+
+        This is the actual user-facing scenario: running any barman command
+        (e.g. list-backups) on a newly configured cloud server triggers
+        xlogdb(), which calls rebuild_xlogdb(silent=True) to create the file.
+        """
+        # GIVEN a cloud server whose xlog.db does not exist yet
+        xlogdb_dir = tmpdir.mkdir("xlogdb_directory")
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+            main_conf={"xlogdb_directory": xlogdb_dir.strpath},
+        )
+        assert not os.path.exists(server.xlogdb_file_path)
+        # WHEN xlogdb() is opened
+        with server.xlogdb() as f:
+            content = f.read()
+        # THEN the xlog.db file was created (empty)
+        assert os.path.exists(server.xlogdb_file_path)
+        assert content == ""
+        # AND no error was emitted
+        mock_output.error.assert_not_called()
+
+    @patch("barman.backup.BackupManager.get_latest_archived_wals_info")
+    def test_get_latest_timeline(self, mock_get_latest_archived_wals_info):
+        """Test that _get_latest_timeline returns the maximum timeline ID from the archived WALs"""
+        # GIVEN a server with mocked get_latest_archived_wals_info method
+        server = build_real_server()
+        mock_get_latest_archived_wals_info.return_value = {
+            "00000001": [],
+            "00000009": [],
+            "0000000B": [],
+        }
+        # WHEN _get_latest_timeline is called
+        latest_timeline = server._get_latest_timeline()
+        # THEN the maximum timeline ID is returned
+        assert latest_timeline == 11
 
     @pytest.mark.parametrize(
         [
@@ -703,6 +781,7 @@ class TestServer(object):
             global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
             main_conf={"wals_directory": wals_dir.strpath},
         )
+        server.postgres = mock.Mock(server_version=90000)
 
         # Prepare input string
         walstring = get_wal_lines_from_wal_list(wal_info_files)
@@ -738,6 +817,552 @@ class TestServer(object):
                 wals.append(wal_file.name)
             # Check for the presence of expected files
             assert expected_wals == wals
+
+    @pytest.mark.parametrize(
+        "partial_files,expected_partial",
+        [
+            (
+                # GIVEN a .partial file for the next expected segment (5),
+                # with end_wal=4 so next expected is 5
+                ["000000020000000000000005.partial"],
+                # THEN the .partial file is returned
+                "000000020000000000000005.partial",
+            ),
+            (
+                # GIVEN a .partial file for the next expected segment name but
+                # on a different timeline (tli=1 vs backup/target tli=2)
+                ["000000010000000000000005.partial"],
+                # THEN no .partial file is returned because the next expected
+                # name includes the timeline (000000020000000000000005), and
+                # the file on tli=1 does not match
+                None,
+            ),
+            (
+                # GIVEN multiple .partial files in the streaming directory
+                [
+                    "000000020000000000000005.partial",
+                    "000000020000000000000007.partial",
+                ],
+                # THEN only the next expected .partial file (segment 5) is
+                # returned — the more recent segment 7 is irrelevant because
+                # we check only for the segment immediately following end_wal
+                "000000020000000000000005.partial",
+            ),
+            (
+                # GIVEN a .partial file for a segment that is NOT the next
+                # expected one (segment 0, while next expected is segment 5)
+                ["000000020000000000000000.partial"],
+                # THEN no .partial file is returned because only the next
+                # expected segment (5) is checked
+                None,
+            ),
+        ],
+    )
+    def test_get_required_xlog_files_partial(
+        self,
+        partial_files,
+        expected_partial,
+        tmpdir,
+    ):
+        """
+        Test that get_required_xlog_files correctly handles .partial WAL files
+        in the streaming directory.
+
+        The implementation computes the name of the segment immediately
+        following the last yielded WAL (``end``) and checks whether that
+        exact .partial file exists.  Only that one file can ever be returned;
+        any other .partial files in the streaming directory are ignored.
+        """
+        wals_dir = tmpdir.mkdir("wals")
+        streaming_dir = tmpdir.mkdir("streaming")
+
+        # GIVEN a backup on timeline 2
+        backup = build_test_backup_info(
+            begin_wal="000000020000000000000001",
+            end_wal="000000020000000000000004",
+            timeline=2,
+        )
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+            main_conf={
+                "wals_directory": wals_dir.strpath,
+                "streaming_wals_directory": streaming_dir.strpath,
+            },
+        )
+        server.postgres = mock.Mock(server_version=90000)
+        # AND an empty xlogdb (so end stays at backup.end_wal = segment 4,
+        # making the next expected segment 5)
+        wals_dir.join(server.xlogdb_file_name).write("")
+        # AND .partial files in the streaming directory
+        for partial_file in partial_files:
+            streaming_dir.join(partial_file).write("dummy")
+
+        # WHEN get_required_xlog_files runs targeting timeline 2 (same as backup)
+        wals = list(
+            server.get_required_xlog_files(backup, target_tli=2, include_partial=True)
+        )
+        partial_wals = [w.name for w in wals if w.name.endswith(".partial")]
+
+        # THEN verify expected .partial file
+        if expected_partial:
+            assert partial_wals == [expected_partial]
+        else:
+            assert partial_wals == []
+
+    def test_get_required_xlog_files_partial_included_for_target_time(
+        self,
+        tmpdir,
+    ):
+        """
+        Test that .partial WAL files ARE returned when target_time is specified.
+
+        Barman copies all available WALs for --target-time restores.
+        Partial files follow the same rule: they are included as long as they fall
+        within the WAL range and match the target timeline, regardless of any
+        archive WAL timestamps.
+        """
+        wals_dir = tmpdir.mkdir("wals")
+        streaming_dir = tmpdir.mkdir("streaming")
+
+        # GIVEN a backup on timeline 2
+        backup = build_test_backup_info(
+            begin_wal="000000020000000000000001",
+            end_wal="000000020000000000000004",
+            timeline=2,
+        )
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+            main_conf={
+                "wals_directory": wals_dir.strpath,
+                "streaming_wals_directory": streaming_dir.strpath,
+            },
+        )
+        server.postgres = mock.Mock(server_version=90000)
+        # AND a WAL in the archive after end_wal with a timestamp beyond target_time
+        wal_after_target = create_fake_info_file("000000020000000000000005", 42, 50)
+        walstring = get_wal_lines_from_wal_list([wal_after_target])
+        xlogdb = wals_dir.join(server.xlogdb_file_name)
+        xlogdb.write(walstring)
+        wals_dir.mkdir("0000000200000000").join("000000020000000000000005").write(
+            "dummy"
+        )
+        # AND a .partial file in the streaming directory
+        streaming_dir.join("000000020000000000000006.partial").write("dummy")
+
+        # WHEN get_required_xlog_files runs with target_time=44
+        wals = list(
+            server.get_required_xlog_files(
+                backup, 2, target_time=44, include_partial=True
+            )
+        )
+        partial_wals = [w.name for w in wals if w.name.endswith(".partial")]
+
+        # THEN the .partial file IS returned because filesystem timestamps are not
+        # used to gate partial file inclusion for --target-time restores
+        assert partial_wals == ["000000020000000000000006.partial"]
+
+    @pytest.mark.parametrize(
+        "xlogdb_wal,partial_file,target_lsn,expected_partial",
+        [
+            (
+                # GIVEN the last archived WAL is segment 6 (so next expected
+                # is segment 7, which is beyond target_wal 6)
+                "000000020000000000000006",
+                # AND the next expected .partial file exists in streaming dir
+                "000000020000000000000007.partial",
+                # AND a target_lsn that maps to segment 000000020000000000000006
+                "0/6000000",
+                # THEN the .partial file is NOT returned because the next
+                # expected segment (7) is beyond the target WAL (6)
+                None,
+            ),
+            (
+                # GIVEN the last archived WAL is segment 5 (so next expected
+                # is segment 6, which equals target_wal 6)
+                "000000020000000000000005",
+                # AND the next expected .partial file exists in streaming dir
+                "000000020000000000000006.partial",
+                # AND a target_lsn that maps to segment 000000020000000000000006
+                "0/6000000",
+                # THEN the .partial file IS returned because segment 6 ==
+                # target_wal (boundary is inclusive)
+                "000000020000000000000006.partial",
+            ),
+            (
+                # GIVEN no additional archived WALs beyond backup.end_wal=4
+                # (so next expected is segment 5, which is before target_wal 6)
+                None,
+                # AND the next expected .partial file exists in streaming dir
+                "000000020000000000000005.partial",
+                # AND a target_lsn that maps to segment 000000020000000000000006
+                "0/6000000",
+                # THEN the .partial file IS returned because segment 5 <
+                # target_wal
+                "000000020000000000000005.partial",
+            ),
+        ],
+    )
+    def test_get_required_xlog_files_partial_target_lsn_boundary(
+        self,
+        xlogdb_wal,
+        partial_file,
+        target_lsn,
+        expected_partial,
+        tmpdir,
+    ):
+        """
+        Test that .partial WAL file inclusion respects the --target-lsn boundary.
+
+        For --target-lsn restores, barman stops copying WALs at the segment that
+        contains the target LSN. The next expected .partial file is excluded if
+        its segment is beyond the target WAL, and included if it is at or before
+        it.
+        """
+        wals_dir = tmpdir.mkdir("wals")
+        streaming_dir = tmpdir.mkdir("streaming")
+
+        # GIVEN a backup on timeline 2
+        backup = build_test_backup_info(
+            begin_wal="000000020000000000000001",
+            end_wal="000000020000000000000004",
+            timeline=2,
+        )
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+            main_conf={
+                "wals_directory": wals_dir.strpath,
+                "streaming_wals_directory": streaming_dir.strpath,
+            },
+        )
+        server.postgres = mock.Mock(server_version=90000)
+        # AND an xlogdb with an optional WAL entry to advance ``end``
+        xlogdb = wals_dir.join(server.xlogdb_file_name)
+        if xlogdb_wal:
+            wal_entry = create_fake_info_file(xlogdb_wal, 42, 50)
+            xlogdb.write(get_wal_lines_from_wal_list([wal_entry]))
+            wals_dir.mkdir("0000000200000000").join(xlogdb_wal).write("dummy")
+        else:
+            xlogdb.write("")
+        # AND a .partial file in the streaming directory
+        streaming_dir.join(partial_file).write("dummy")
+
+        # WHEN get_required_xlog_files runs with the given target_lsn
+        wals = list(
+            server.get_required_xlog_files(
+                backup, 2, target_lsn=target_lsn, include_partial=True
+            )
+        )
+        partial_wals = [w.name for w in wals if w.name.endswith(".partial")]
+
+        # THEN verify whether the .partial file is included
+        if expected_partial:
+            assert partial_wals == [expected_partial]
+        else:
+            assert partial_wals == []
+
+    def test_get_required_xlog_files_partial_not_included_for_target_immediate(
+        self,
+        tmpdir,
+    ):
+        """
+        Test that .partial WAL files are NOT returned when target_immediate is
+        set, regardless of any other parameters.
+
+        With --target-immediate, recovery stops as soon as the first consistent
+        state is reached, so partial files in the streaming directory are never
+        needed.
+        """
+        wals_dir = tmpdir.mkdir("wals")
+        streaming_dir = tmpdir.mkdir("streaming")
+
+        # GIVEN a backup on timeline 2
+        backup = build_test_backup_info(
+            begin_wal="000000020000000000000001",
+            end_wal="000000020000000000000004",
+            timeline=2,
+        )
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+            main_conf={
+                "wals_directory": wals_dir.strpath,
+                "streaming_wals_directory": streaming_dir.strpath,
+            },
+        )
+        server.postgres = mock.Mock(server_version=90000)
+        # AND an empty xlogdb
+        wals_dir.join(server.xlogdb_file_name).write("")
+        # AND a .partial file in the streaming directory on the correct timeline
+        streaming_dir.join("000000020000000000000005.partial").write("dummy")
+
+        # WHEN get_required_xlog_files runs with target_immediate=True
+        wals = list(
+            server.get_required_xlog_files(
+                backup, 2, target_immediate=True, include_partial=True
+            )
+        )
+        partial_wals = [w.name for w in wals if w.name.endswith(".partial")]
+
+        # THEN the .partial file is NOT returned
+        assert partial_wals == []
+
+    def test_get_required_xlog_files_partial_not_included_for_wrong_timeline(
+        self,
+        tmpdir,
+    ):
+        """
+        Test that a .partial file is NOT returned when ``end`` (the last
+        yielded WAL) is on a different timeline than the recovery target.
+
+        This can happen after a timeline switch when no WALs from the new
+        timeline have been archived yet, so ``end`` stays at
+        ``backup.end_wal`` which is on the old timeline.  In that case we
+        cannot determine the correct next expected segment on the new
+        timeline, so we conservatively skip the partial check entirely.
+        """
+        wals_dir = tmpdir.mkdir("wals")
+        streaming_dir = tmpdir.mkdir("streaming")
+
+        # GIVEN a backup on timeline 1
+        backup = build_test_backup_info(
+            begin_wal="000000010000000000000001",
+            end_wal="000000010000000000000004",
+            timeline=1,
+        )
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+            main_conf={
+                "wals_directory": wals_dir.strpath,
+                "streaming_wals_directory": streaming_dir.strpath,
+            },
+        )
+        server.postgres = mock.Mock(server_version=90000)
+        # AND an empty xlogdb (so end stays at backup.end_wal = tli=1 segment 4)
+        wals_dir.join(server.xlogdb_file_name).write("")
+        # AND a .partial file on the OLD timeline (tli=1) in the streaming dir
+        streaming_dir.join("000000010000000000000005.partial").write("dummy")
+
+        # WHEN get_required_xlog_files runs targeting timeline 2
+        wals = list(
+            server.get_required_xlog_files(backup, target_tli=2, include_partial=True)
+        )
+        partial_wals = [w.name for w in wals if w.name.endswith(".partial")]
+
+        # THEN the .partial file is NOT returned because end is on tli=1
+        # while calculated_target_tli=2, so next_expected is also on tli=1
+        # and the timeline guard rejects it
+        assert partial_wals == []
+
+    def test_get_required_xlog_files_skips_archive_partial_by_default(
+        self,
+        tmpdir,
+    ):
+        """
+        Test that .partial WAL files present in the main WAL archive (xlogdb)
+        are NOT yielded when include_partial is False (the default).
+
+        Before this fix, .partial files from the archive were always yielded
+        unconditionally, meaning _xlog_copy had to silently discard them.
+        Now the filtering happens at the source.
+        """
+        wals_dir = tmpdir.mkdir("wals")
+        streaming_dir = tmpdir.mkdir("streaming")
+
+        # GIVEN a backup on timeline 2
+        backup = build_test_backup_info(
+            begin_wal="000000020000000000000001",
+            end_wal="000000020000000000000004",
+            timeline=2,
+        )
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+            main_conf={
+                "wals_directory": wals_dir.strpath,
+                "streaming_wals_directory": streaming_dir.strpath,
+            },
+        )
+        # AND xlogdb contains both a regular WAL and a .partial WAL
+        regular_wal = create_fake_info_file("000000020000000000000005", 42, 50)
+        partial_wal = create_fake_info_file("000000020000000000000006.partial", 42, 51)
+        walstring = get_wal_lines_from_wal_list([regular_wal, partial_wal])
+        wals_dir.join(server.xlogdb_file_name).write(walstring)
+        wals_dir.mkdir("0000000200000000").join("000000020000000000000005").write(
+            "dummy"
+        )
+        wals_dir.join("0000000200000000").join(
+            "000000020000000000000006.partial"
+        ).write("dummy")
+
+        # WHEN get_required_xlog_files runs WITHOUT include_partial (default)
+        wals = list(server.get_required_xlog_files(backup, target_tli=2))
+        wal_names = [w.name for w in wals]
+
+        # THEN the regular WAL is returned
+        assert "000000020000000000000005" in wal_names
+        # AND the .partial WAL from the archive is NOT returned
+        assert "000000020000000000000006.partial" not in wal_names
+
+    def test_get_required_xlog_files_includes_archive_partial_when_requested(
+        self,
+        tmpdir,
+    ):
+        """
+        Test that .partial WAL files present in the main WAL archive (xlogdb)
+        ARE yielded when include_partial is True.
+        """
+        wals_dir = tmpdir.mkdir("wals")
+        streaming_dir = tmpdir.mkdir("streaming")
+
+        # GIVEN a backup on timeline 2
+        backup = build_test_backup_info(
+            begin_wal="000000020000000000000001",
+            end_wal="000000020000000000000004",
+            timeline=2,
+        )
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+            main_conf={
+                "wals_directory": wals_dir.strpath,
+                "streaming_wals_directory": streaming_dir.strpath,
+            },
+        )
+        server.postgres = mock.Mock(server_version=90000)
+        # AND xlogdb contains both a regular WAL and a .partial WAL
+        regular_wal = create_fake_info_file("000000020000000000000005", 42, 50)
+        partial_wal = create_fake_info_file("000000020000000000000006.partial", 42, 51)
+        walstring = get_wal_lines_from_wal_list([regular_wal, partial_wal])
+        wals_dir.join(server.xlogdb_file_name).write(walstring)
+        wals_dir.mkdir("0000000200000000").join("000000020000000000000005").write(
+            "dummy"
+        )
+        wals_dir.join("0000000200000000").join(
+            "000000020000000000000006.partial"
+        ).write("dummy")
+
+        # WHEN get_required_xlog_files runs WITH include_partial=True
+        wals = list(
+            server.get_required_xlog_files(backup, target_tli=2, include_partial=True)
+        )
+        wal_names = [w.name for w in wals]
+
+        # THEN both the regular WAL and the .partial WAL are returned
+        assert "000000020000000000000005" in wal_names
+        assert "000000020000000000000006.partial" in wal_names
+
+    @patch("barman.server.Server._get_latest_timeline")
+    def test_get_required_xlog_files_timeline_is_latest_if_doing_pitr_and_postgres_at_least_12(
+        self,
+        mock_get_latest_timeline,
+        tmpdir,
+    ):
+        """
+        Test that when doing PITR without specifying target_tli and Postgres >= 12,
+        get_required_xlog_files defaults to the latest timeline from xlogdb.
+
+        PostgreSQL 12+ changed the default for recovery_target_timeline from
+        'current' to 'latest'. PITR options (target_time, target_xid) don't
+        change the timeline selection — they only affect which WAL content is
+        needed for recovery.
+        """
+        wals_dir = tmpdir.mkdir("wals")
+        streaming_dir = tmpdir.mkdir("streaming")
+
+        # GIVEN a backup on timeline 1
+        backup = build_test_backup_info(
+            begin_wal="000000010000000000000001",
+            end_wal="000000010000000000000003",
+            timeline=1,
+        )
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+            main_conf={
+                "wals_directory": wals_dir.strpath,
+                "streaming_wals_directory": streaming_dir.strpath,
+            },
+        )
+        # AND Postgres version is 12 or later
+        server.postgres = mock.Mock(server_version=120000)
+        # AND xlogdb contains WAL files on timeline 1 and timeline 2 (latest)
+        wal_tli1_1 = create_fake_info_file("000000010000000000000001", 42, 50)
+        wal_tli1_2 = create_fake_info_file("000000010000000000000002", 42, 51)
+        wal_tli1_3 = create_fake_info_file("000000010000000000000003", 42, 52)
+        history_tli2 = create_fake_info_file("00000002.history", 10, 53)
+        wal_tli2_1 = create_fake_info_file("000000020000000000000003", 42, 54)
+        wal_tli2_2 = create_fake_info_file("000000020000000000000004", 42, 55)
+        walstring = get_wal_lines_from_wal_list(
+            [wal_tli1_1, wal_tli1_2, wal_tli1_3, history_tli2, wal_tli2_1, wal_tli2_2]
+        )
+        wals_dir.join(server.xlogdb_file_name).write(walstring)
+        mock_get_latest_timeline.return_value = 2
+
+        # WHEN get_required_xlog_files runs with PITR options but no target_tli
+        wals = list(
+            server.get_required_xlog_files(backup, target_time="2024-01-01 12:00:00")
+        )
+        wal_names = [w.name for w in wals]
+
+        # THEN WAL files from both timeline 1 and timeline 2 are returned
+        # (because latest timeline is 2, and PITR options don't restrict timeline)
+        assert "000000010000000000000001" in wal_names
+        assert "000000010000000000000002" in wal_names
+        assert "000000010000000000000003" in wal_names
+        assert "00000002.history" in wal_names
+        assert "000000020000000000000003" in wal_names
+        assert "000000020000000000000004" in wal_names
+
+    def test_get_required_xlog_files_timeline_is_current_if_postgres_less_than_12(
+        self,
+        tmpdir,
+    ):
+        """
+        Test that when target_tli is not specified and Postgres < 12, the
+        get_required_xlog_files method defaults to the backup's timeline.
+
+        PostgreSQL versions before 12 defaulted recovery_target_timeline to
+        'current', meaning the timeline of the backup being restored.
+        """
+        wals_dir = tmpdir.mkdir("wals")
+        streaming_dir = tmpdir.mkdir("streaming")
+
+        # GIVEN a backup on timeline 1
+        backup = build_test_backup_info(
+            begin_wal="000000010000000000000001",
+            end_wal="000000010000000000000003",
+            timeline=1,
+        )
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+            main_conf={
+                "wals_directory": wals_dir.strpath,
+                "streaming_wals_directory": streaming_dir.strpath,
+            },
+        )
+        # AND Postgres version is older than 12
+        server.postgres = mock.Mock(server_version=110000)
+        # AND xlogdb contains WAL files on timeline 1 and timeline 2
+        wal_tli1_1 = create_fake_info_file("000000010000000000000001", 42, 50)
+        wal_tli1_2 = create_fake_info_file("000000010000000000000002", 42, 51)
+        wal_tli1_3 = create_fake_info_file("000000010000000000000003", 42, 52)
+        history_tli2 = create_fake_info_file("00000002.history", 10, 53)
+        wal_tli2_1 = create_fake_info_file("000000020000000000000003", 42, 54)
+        wal_tli2_2 = create_fake_info_file("000000020000000000000004", 42, 55)
+        walstring = get_wal_lines_from_wal_list(
+            [wal_tli1_1, wal_tli1_2, wal_tli1_3, history_tli2, wal_tli2_1, wal_tli2_2]
+        )
+        wals_dir.join(server.xlogdb_file_name).write(walstring)
+
+        # WHEN get_required_xlog_files runs WITHOUT specifying target_tli
+        wals = list(server.get_required_xlog_files(backup))
+        wal_names = [w.name for w in wals]
+
+        # THEN only WAL files from timeline 1 (backup's timeline) are returned
+        assert "000000010000000000000001" in wal_names
+        assert "000000010000000000000002" in wal_names
+        assert "000000010000000000000003" in wal_names
+        # AND history files are always included
+        assert "00000002.history" in wal_names
+        # AND WAL files from timeline 2 are NOT returned
+        assert "000000020000000000000003" not in wal_names
+        assert "000000020000000000000004" not in wal_names
 
     @pytest.mark.parametrize(
         "wal_info_files,expected_indices",
@@ -3600,7 +4225,7 @@ class TestServer(object):
         server.backup_manager = Mock()
 
         # WHEN cloud_wal_archive is called
-        server.cloud_wal_archive("some_wal_file")
+        server.cloud_wal_archive("some_wal_file", parallel=0)
 
         # THEN expected error is logged
         mock_output.error.assert_called_once_with(
@@ -3632,14 +4257,13 @@ class TestServer(object):
         mock_use_wal_cloud_storage.return_value = False
 
         # WHEN cloud_wal_archive is called
-        server.cloud_wal_archive("some_wal_file")
+        server.cloud_wal_archive("some_wal_file", parallel=0)
 
         # THEN expected error is logged
         mock_output.error.assert_called_once_with(
             "cloud-wal-archive is not supported for server %s because no cloud storage "
-            "configuration is set in 'wals_directory'. Please check the "
-            "configuration of server %s.",
-            server.config.name,
+            "configuration is set in 'wals_directory'. Please check the server "
+            "configuration.",
             server.config.name,
         )
 
@@ -3663,13 +4287,54 @@ class TestServer(object):
         mock_use_wal_cloud_storage.return_value = True
 
         # WHEN cloud_wal_archive is called
-        server.cloud_wal_archive("some_wal_file")
+        server.cloud_wal_archive("some_wal_file", parallel=4)
 
-        # THEN the manager's cloud_wal_archive method is called with the correct file name
-        server.backup_manager.cloud_wal_archive.assert_called_once_with("some_wal_file")
+        # THEN the manager's cloud_wal_archive method is called with all args
+        server.backup_manager.cloud_wal_archive.assert_called_once_with(
+            "some_wal_file", 4
+        )
 
         # AND no error is logged
         mock_output.error.assert_not_called()
+
+    @patch("barman.server.Server.use_wal_cloud_storage", new_callable=PropertyMock)
+    def test_cloud_wal_restore_success(self, mock_use_wal_cloud_storage):
+        """
+        Test that the cloud_wal_restore method successfully restores the WAL file
+        when the server is properly configured for cloud storage by asserting the
+        backup manager is called with the correct parameters.
+        """
+        server = build_real_server()
+        server.backup_manager = Mock()
+        mock_use_wal_cloud_storage.return_value = True
+
+        server.cloud_wal_restore("some_wal_file", "some_dest_path", "/path/to/spool")
+
+        server.backup_manager.cloud_wal_restore.assert_called_once_with(
+            "some_wal_file", "some_dest_path", "/path/to/spool"
+        )
+
+    @patch("barman.server.Server.use_wal_cloud_storage", new_callable=PropertyMock)
+    @patch("barman.server.output")
+    def test_cloud_wal_restore_no_cloud_storage_configured(
+        self, mock_output, mock_use_wal_cloud_storage
+    ):
+        """
+        Test that the cloud_wal_restore method logs an error and returns without
+        calling the backup manager when no cloud storage is configured for the server.
+        """
+        server = build_real_server()
+        server.backup_manager = Mock()
+        mock_use_wal_cloud_storage.return_value = False
+
+        server.cloud_wal_restore("some_wal_file", "some_dest_path", "/path/to/spool")
+
+        server.backup_manager.cloud_wal_restore.assert_not_called()
+        mock_output.error.assert_called_once_with(
+            "cloud-wal-restore is not supported for server %s because no cloud "
+            "storage configuration is set in 'wals_directory'. Please check the "
+            "configuration of the server." % server.config.name,
+        )
 
     def test_get_systemid_file_path(self):
         # Basic test for the get_systemid_file_path function
@@ -4435,7 +5100,7 @@ class TestServer(object):
     @patch("barman.server.datetime")
     def test_get_errors_dst(self, mock_datetime, suffix):
         """
-        Test the _get_errors_dst method generates correct destination paths
+        Test the get_errors_dst method generates correct destination paths
         """
         errors_dir = "path/to/errors"
         server = build_real_server(
@@ -4451,7 +5116,7 @@ class TestServer(object):
         mock_datetime.datetime.now.return_value = mock_now
 
         filename = "000000010000000000000001"
-        result = server._get_errors_dst(filename, suffix)
+        result = server.get_errors_dst(filename, suffix)
 
         # Verify datetime.now was called with timezone.utc
         mock_datetime.datetime.now.assert_called_once_with(mock_datetime.timezone.utc)
@@ -4485,32 +5150,6 @@ class TestServer(object):
         server.move_wal_file_to_errors_directory(src, filename, suffix)
         mock_shutil.move.assert_called_once_with(src, error_dst)
         mock_shutil.copy.assert_not_called()
-
-    @pytest.mark.parametrize(
-        "suffix",
-        ["duplicate", "unknown"],
-    )
-    @patch("barman.server.shutil")
-    def test_copy_wal_file_to_errors_directory(self, mock_shutil, suffix):
-        """
-        Test the copy_wal_file_to_errors_directory method generates correct destination
-        paths and copies the file to the errors directory.
-        """
-        errors_dir = "path/to/errors"
-        server = build_real_server(
-            main_conf={
-                "backup_options": "concurrent_backup",
-                "errors_directory": errors_dir,
-            }
-        )
-
-        src = "original_file"
-        filename = "filename"
-        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        error_dst = "%s/%s.%s.%s" % (errors_dir, filename, stamp, suffix)
-        server.copy_wal_file_to_errors_directory(src, filename, suffix)
-        mock_shutil.copy.assert_called_once_with(src, error_dst)
-        mock_shutil.move.assert_not_called()
 
 
 class TestCheckStrategy(object):
@@ -4644,3 +5283,610 @@ class TestCheckStrategy(object):
 
     def test_get_backup_cloud_interface(self):
         pass
+
+
+class TestExportBackup(object):
+    """Test class for Server.export_backup."""
+
+    @patch("os.rename")
+    @patch("barman.server.file_hash", return_value="abc12345")
+    @patch("barman.server.get_barman_system_info")
+    def test_export_backup_success(
+        self, mock_get_system_info, mock_file_hash, mock_rename, tmpdir
+    ):
+        """
+        Test that export_backup orchestrates the export process correctly.
+        """
+        # GIVEN a server with a valid backup
+        output_directory = tmpdir.mkdir("export")
+
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+        )
+
+        backup_info = build_test_backup_info(
+            backup_id="20240101T120000",
+            server=server,
+        )
+
+        # AND identity data and system info are available
+        identity_data = {"systemid": "1234567890"}
+        mock_get_system_info.return_value = {"barman_ver": "3.10.0"}
+
+        # WHEN export_backup is called
+        with patch.object(server, "read_identity_file", return_value=identity_data):
+            with patch.object(server.backup_manager, "export_backup") as mock_export:
+                server.export_backup(backup_info, output_directory.strpath)
+
+        # THEN backup_manager.export_backup was called with correct arguments
+        mock_export.assert_called_once()
+        call_args = mock_export.call_args
+        assert call_args[0][0] == backup_info
+        assert call_args[0][1].startswith(output_directory.strpath)
+        assert call_args[0][1].endswith(".tmp")
+        assert call_args[0][2] == identity_data
+        assert call_args[0][3] == {"barman_ver": "3.10.0"}
+        assert call_args[1]["compression"] is None
+        assert call_args[1]["compression_level"] is None
+
+        # AND file_hash was called on the temp file
+        mock_file_hash.assert_called_once()
+
+        # AND os.rename was called with correct temp and final paths
+        mock_rename.assert_called_once()
+        rename_args = mock_rename.call_args[0]
+        assert rename_args[0].endswith(".tmp")
+        assert rename_args[1].endswith(".tar")
+        assert "abc12345" in rename_args[1]
+
+    @pytest.mark.parametrize(
+        "compression,expected_ext",
+        [
+            (None, ".tar"),
+            ("gzip", ".tar.gz"),
+            ("bzip2", ".tar.bz2"),
+            ("xz", ".tar.xz"),
+        ],
+    )
+    @patch("os.rename")
+    @patch("barman.server.file_hash", return_value="abc12345")
+    @patch("barman.server.get_barman_system_info")
+    def test_export_backup_compression_extension(
+        self,
+        mock_get_system_info,
+        mock_file_hash,
+        mock_rename,
+        compression,
+        expected_ext,
+        tmpdir,
+    ):
+        """
+        Test that export_backup produces the correct file extension and forwards
+        compression options to backup_manager.export_backup.
+        """
+        # GIVEN a server with a valid backup
+        output_directory = tmpdir.mkdir("export")
+
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+        )
+
+        backup_info = build_test_backup_info(
+            backup_id="20240101T120000",
+            server=server,
+        )
+
+        # AND identity data and system info are available
+        identity_data = {"systemid": "1234567890"}
+        mock_get_system_info.return_value = {"barman_ver": "3.10.0"}
+
+        # WHEN export_backup is called with the specified compression
+        with patch.object(server, "read_identity_file", return_value=identity_data):
+            with patch.object(server.backup_manager, "export_backup") as mock_export:
+                server.export_backup(
+                    backup_info,
+                    output_directory.strpath,
+                    compression=compression,
+                    compression_level=5,
+                )
+
+        # THEN backup_manager.export_backup receives the compression arguments
+        call_kwargs = mock_export.call_args[1]
+        assert call_kwargs["compression"] == compression
+        assert call_kwargs["compression_level"] == 5
+
+        # AND os.rename produces a file with the correct extension
+        rename_args = mock_rename.call_args[0]
+        assert rename_args[1].endswith(expected_ext)
+
+    def test_export_backup_no_identity_returns_error(self, tmpdir, capsys):
+        """
+        Test that export_backup returns early with an error when no identity
+        file exists.
+        """
+        # GIVEN a server without an identity file
+        backup_dir = tmpdir.mkdir("base")
+        output_directory = tmpdir.mkdir("export")
+
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+            main_conf={
+                "basebackups_directory": backup_dir.strpath,
+            },
+        )
+
+        backup_info = build_test_backup_info(
+            backup_id="20240101T120000",
+            server=server,
+        )
+
+        # WHEN export_backup is called with no identity file
+        with patch.object(server, "read_identity_file", return_value={}):
+            server.export_backup(backup_info, output_directory.strpath)
+
+        # THEN no tarball is created
+        export_files = [
+            f for f in os.listdir(output_directory.strpath) if f.endswith(".tar")
+        ]
+        assert len(export_files) == 0
+
+        # AND an error message is displayed
+        out, err = capsys.readouterr()
+        assert "No identity file found" in err
+        assert "identity file is required" in err
+
+    def test_export_backup_cloud_storage_returns_error(self, tmpdir, capsys):
+        """
+        Test that export_backup returns early with an error when cloud storage
+        is configured.
+        """
+        # GIVEN a server with cloud storage configured
+        output_directory = tmpdir.mkdir("export")
+
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+        )
+
+        backup_info = build_test_backup_info(
+            backup_id="20240101T120000",
+            server=server,
+        )
+
+        # AND cloud storage is configured
+        with patch.object(
+            type(server), "use_backup_cloud_storage", new_callable=PropertyMock
+        ) as mock_cloud:
+            mock_cloud.return_value = True
+            # WHEN export_backup is called
+            server.export_backup(backup_info, output_directory.strpath)
+
+        # THEN no tarball is created
+        export_files = [
+            f for f in os.listdir(output_directory.strpath) if f.endswith(".tar")
+        ]
+        assert len(export_files) == 0
+
+        # AND an error message is displayed
+        out, err = capsys.readouterr()
+        assert "not supported for cloud storage" in err
+
+    def test_export_backup_cleanup_on_failure(self, tmpdir):
+        """
+        Test that export_backup cleans up temp file on failure.
+        """
+        # GIVEN a server
+        backup_dir = tmpdir.mkdir("base")
+        output_directory = tmpdir.mkdir("export")
+
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+            main_conf={
+                "basebackups_directory": backup_dir.strpath,
+            },
+        )
+
+        backup_info = build_test_backup_info(
+            backup_id="20240101T120000",
+            server=server,
+        )
+
+        # AND the backup_manager.export_backup will raise an exception
+        with patch.object(
+            server.backup_manager, "export_backup", side_effect=Exception("Test error")
+        ):
+            with patch.object(
+                server, "read_identity_file", return_value={"systemid": "1234567890"}
+            ):
+                # WHEN export_backup is called
+                # THEN an exception is raised
+                with pytest.raises(Exception, match="Test error"):
+                    server.export_backup(backup_info, output_directory.strpath)
+
+        # AND no files are left in the export directory
+        assert len(os.listdir(output_directory.strpath)) == 0
+
+    @pytest.mark.parametrize(
+        "lock_exception, expected_message",
+        [
+            (LockFileBusy(), "Another backup operation is already running"),
+            (LockFilePermissionDenied(), "Permission denied while acquiring"),
+            (LockFileException("disk full"), "Unable to acquire backup export lock"),
+        ],
+    )
+    def test_export_backup_lock_acquisition_failure(
+        self, tmpdir, capsys, lock_exception, expected_message
+    ):
+        """
+        Test that export_backup reports a clear error when acquiring the
+        source-backup lock fails, and does not propagate the exception.
+        """
+        # GIVEN a server with valid identity
+        backup_dir = tmpdir.mkdir("base")
+        output_directory = tmpdir.mkdir("export")
+
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+            main_conf={
+                "basebackups_directory": backup_dir.strpath,
+            },
+        )
+
+        backup_info = build_test_backup_info(
+            backup_id="20240101T120000",
+            server=server,
+        )
+
+        identity_data = {"systemid": "1234567890"}
+
+        # WHEN export_backup is called and acquiring ServerBackupIdLock raises
+        # the given LockFile* exception
+        with patch.object(server, "read_identity_file", return_value=identity_data):
+            with patch("barman.server.ServerBackupIdLock") as mock_lock_cls:
+                mock_lock_cls.return_value.__enter__.side_effect = lock_exception
+                # THEN no exception is propagated
+                server.export_backup(backup_info, output_directory.strpath)
+
+        # AND the right error message is reported
+        out, err = capsys.readouterr()
+        assert expected_message in err
+
+
+class TestImportBackup(object):
+    """Test class for Server.import_backup."""
+
+    def test_import_backup_success(self, tmpdir):
+        """
+        Test that import_backup orchestrates the import process correctly.
+        """
+        # GIVEN a server with a valid identity file
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+        )
+
+        identity_data = {"systemid": "1234567890", "version": "15"}
+        input_tarball = "/some/backup.tar"
+
+        # WHEN import_backup is called
+        with patch.object(server, "read_identity_file", return_value=identity_data):
+            with patch.object(server, "_make_directories"):
+                with patch.object(
+                    server,
+                    "_validate_import_tarball_name",
+                    return_value="20240101T120000",
+                ):
+                    with patch.object(
+                        server.backup_manager, "import_backup"
+                    ) as mock_import:
+                        server.import_backup(input_tarball)
+
+        # THEN backup_manager.import_backup was called with correct arguments
+        mock_import.assert_called_once_with(
+            input_tarball, identity_data, "20240101T120000"
+        )
+
+    def test_import_backup_no_identity_returns_error(self, tmpdir, capsys):
+        """
+        Test that import_backup returns early with an error when no identity
+        file exists.
+        """
+        # GIVEN a server without an identity file
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+        )
+
+        # WHEN import_backup is called with no identity file
+        with patch.object(server, "read_identity_file", return_value={}):
+            with patch.object(server.backup_manager, "import_backup") as mock_import:
+                server.import_backup("/some/backup.tar")
+
+        # THEN an error message is displayed
+        out, err = capsys.readouterr()
+        assert "No identity file found" in err
+        assert "identity file is required" in err
+
+        # AND backup_manager.import_backup was NOT called
+        mock_import.assert_not_called()
+
+    def test_import_backup_cloud_storage_returns_error(self, tmpdir, capsys):
+        """
+        Test that import_backup returns early with an error when cloud storage
+        is configured.
+        """
+        # GIVEN a server with cloud storage configured
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+        )
+
+        # AND cloud storage is configured
+        with patch.object(
+            type(server), "use_backup_cloud_storage", new_callable=PropertyMock
+        ) as mock_cloud:
+            mock_cloud.return_value = True
+            # WHEN import_backup is called
+            server.import_backup("/some/backup.tar")
+
+        # THEN an error message is displayed
+        out, err = capsys.readouterr()
+        assert "not supported for cloud storage" in err
+
+    def test_import_backup_make_directories_failure(self, tmpdir, capsys):
+        """
+        Test that import_backup returns early with an error when directory
+        creation fails.
+        """
+        # GIVEN a server with valid identity
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+        )
+
+        identity_data = {"systemid": "1234567890"}
+        os_error = OSError(13, "Permission denied")
+        os_error.filename = "/some/dir"
+
+        # WHEN import_backup is called and _make_directories fails
+        with patch.object(server, "read_identity_file", return_value=identity_data):
+            with patch.object(server, "_make_directories", side_effect=os_error):
+                server.import_backup("/some/backup.tar")
+
+        # THEN an error message is displayed
+        out, err = capsys.readouterr()
+        assert "Failed to create backup directory" in err
+
+    def test_import_backup_invalid_tarball_name_returns_error(self, tmpdir):
+        """
+        Test that import_backup returns early when the tarball filename
+        does not pass validation.
+        """
+        # GIVEN a server with valid identity
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+        )
+
+        identity_data = {"systemid": "1234567890"}
+
+        # WHEN import_backup is called with an invalid filename
+        with patch.object(server, "read_identity_file", return_value=identity_data):
+            with patch.object(server, "_make_directories"):
+                with patch.object(
+                    server, "_validate_import_tarball_name", return_value=None
+                ):
+                    with patch.object(
+                        server.backup_manager, "import_backup"
+                    ) as mock_import:
+                        server.import_backup("/some/bad-name.tar")
+
+        # THEN backup_manager.import_backup was NOT called
+        mock_import.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "extension",
+        [".tar", ".tar.gz", ".tar.bz2", ".tar.xz"],
+    )
+    def test_validate_import_tarball_name_valid(self, tmpdir, extension):
+        """
+        Test that _validate_import_tarball_name returns the backup_id for a
+        tarball with a valid filename and matching checksum, for each of the
+        supported tarball extensions.
+        """
+        # GIVEN a server
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+        )
+
+        # AND a tarball with a valid export filename and matching checksum
+        tarball_path = tmpdir.join(
+            "backup-export-main-20240101T120000-20240101T130000-abcd1234" + extension
+        ).strpath
+        with open(tarball_path, "wb") as f:
+            f.write(b"test content")
+
+        # AND the checksum matches
+        with patch("barman.server.file_hash", return_value="abcd1234" + "0" * 56):
+            # WHEN _validate_import_tarball_name is called
+            result = server._validate_import_tarball_name(tarball_path)
+
+        # THEN it returns the backup_id
+        assert result == "20240101T120000"
+
+    def test_validate_import_tarball_name_invalid_pattern(self, tmpdir, capsys):
+        """
+        Test that _validate_import_tarball_name returns None for a filename
+        that doesn't match the expected pattern.
+        """
+        # GIVEN a server
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+        )
+
+        # AND a tarball with an invalid filename
+        tarball_path = tmpdir.join("random-backup.tar").strpath
+        with open(tarball_path, "wb") as f:
+            f.write(b"test content")
+
+        # WHEN _validate_import_tarball_name is called
+        result = server._validate_import_tarball_name(tarball_path)
+
+        # THEN it returns None
+        assert result is None
+
+        # AND an error about the filename format is displayed
+        out, err = capsys.readouterr()
+        assert "does not match the expected export format" in err
+
+    def test_validate_import_tarball_name_checksum_mismatch(self, tmpdir, capsys):
+        """
+        Test that _validate_import_tarball_name returns None when the
+        embedded checksum does not match the file's actual checksum.
+        """
+        # GIVEN a server
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+        )
+
+        # AND a tarball with a valid filename but wrong checksum
+        tarball_path = tmpdir.join(
+            "backup-export-main-20240101T120000-20240101T130000-abcd1234.tar"
+        ).strpath
+        with open(tarball_path, "wb") as f:
+            f.write(b"test content")
+
+        # AND the actual checksum is different
+        with patch("barman.server.file_hash", return_value="deadbeef" + "0" * 56):
+            # WHEN _validate_import_tarball_name is called
+            result = server._validate_import_tarball_name(tarball_path)
+
+        # THEN it returns None
+        assert result is None
+
+        # AND an error about checksum mismatch is displayed
+        out, err = capsys.readouterr()
+        assert "checksum mismatch" in err.lower()
+        assert "abcd1234" in err
+        assert "deadbeef" in err
+
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "backup-export-.tar",
+            "backup-export-main-20240101T120000-abcd1234.tar",
+            "backup-export-main-20240101T120000-20240101T130000-abcd1234.zip",
+            "backup-export-main-20240101T120000-20240101T130000-abcd1234.tar.zst",
+            "not-an-export.tar",
+        ],
+    )
+    def test_validate_import_tarball_name_rejects_bad_patterns(self, tmpdir, filename):
+        """
+        Test that _validate_import_tarball_name rejects various malformed
+        filenames.
+        """
+        # GIVEN a server
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+        )
+
+        # AND a tarball with a malformed filename
+        tarball_path = tmpdir.join(filename).strpath
+        with open(tarball_path, "wb") as f:
+            f.write(b"test content")
+
+        # WHEN _validate_import_tarball_name is called
+        result = server._validate_import_tarball_name(tarball_path)
+
+        # THEN it returns None
+        assert result is None
+
+    def test_validate_import_tarball_name_server_with_hyphens(self, tmpdir):
+        """
+        Test that _validate_import_tarball_name correctly handles server
+        names containing hyphens.
+        """
+        # GIVEN a server whose name contains hyphens
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+        )
+        server.config.name = "my-pg-server"
+
+        # AND a tarball with that hyphenated server name
+        tarball_path = tmpdir.join(
+            "backup-export-my-pg-server-20240101T120000-20240101T130000-abcd1234.tar"
+        ).strpath
+        with open(tarball_path, "wb") as f:
+            f.write(b"test content")
+
+        # AND the checksum matches
+        with patch("barman.server.file_hash", return_value="abcd1234" + "0" * 56):
+            # WHEN _validate_import_tarball_name is called
+            result = server._validate_import_tarball_name(tarball_path)
+
+        # THEN it returns the backup_id
+        assert result == "20240101T120000"
+
+    def test_validate_import_tarball_name_wrong_server(self, tmpdir, capsys):
+        """
+        Test that _validate_import_tarball_name rejects a tarball exported
+        from a different server.
+        """
+        # GIVEN a server
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+        )
+
+        # AND a tarball exported from a different server
+        tarball_path = tmpdir.join(
+            "backup-export-other-server-20240101T120000-20240101T130000-abcd1234.tar"
+        ).strpath
+        with open(tarball_path, "wb") as f:
+            f.write(b"test content")
+
+        # WHEN _validate_import_tarball_name is called
+        result = server._validate_import_tarball_name(tarball_path)
+
+        # THEN it returns None
+        assert result is None
+
+        # AND an error about the filename format is displayed
+        out, err = capsys.readouterr()
+        assert "does not match the expected export format" in err
+
+    @pytest.mark.parametrize(
+        "lock_exception, expected_message",
+        [
+            (LockFileBusy(), "Another backup operation is already running"),
+            (LockFilePermissionDenied(), "Permission denied while acquiring"),
+            (LockFileException("disk full"), "Unable to acquire backup import lock"),
+        ],
+    )
+    def test_import_backup_lock_acquisition_failure(
+        self, tmpdir, capsys, lock_exception, expected_message
+    ):
+        """
+        Test that import_backup reports a clear error when lock acquisition
+        (or any operation under the lock) raises a LockFile* exception, and
+        does not propagate the exception.
+        """
+        # GIVEN a server with valid identity
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+        )
+        identity_data = {"systemid": "1234567890", "version": "15"}
+
+        # WHEN import_backup is called and the operation under the lock raises
+        # the given LockFile* exception
+        with patch.object(server, "read_identity_file", return_value=identity_data):
+            with patch.object(server, "_make_directories"):
+                with patch.object(
+                    server,
+                    "_validate_import_tarball_name",
+                    return_value="20240101T120000",
+                ):
+                    with patch.object(
+                        server.backup_manager,
+                        "import_backup",
+                        side_effect=lock_exception,
+                    ):
+                        # THEN no exception is propagated
+                        server.import_backup("/some/backup.tar")
+
+        # AND the right error message is reported
+        out, err = capsys.readouterr()
+        assert expected_message in err

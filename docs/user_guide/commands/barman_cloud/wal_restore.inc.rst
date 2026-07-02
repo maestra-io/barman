@@ -21,6 +21,8 @@
                   [ { --azure-credential | --credential } { azure-cli | managed-identity
                     | default } ]
                   [ --no-partial ]
+                  [ { -p, --parallel } PARALLEL ]
+                  [ --spool-dir SPOOL_DIR ]
                   SOURCE_URL SERVER_NAME WAL_NAME WAL_DEST
 
 **Description**
@@ -33,6 +35,26 @@ This script is used to download WAL files that were previously archived with the
 ``barman-cloud-wal-archive`` command. Disable automatic download of ``.partial`` files by
 calling ``--no-partial`` option.
 
+.. note::
+
+  Partial WAL files (with a ``.partial`` suffix) can appear in the object store
+  when a standby server is archiving WAL segments and is then promoted to primary.
+  At the moment of promotion, the in-progress WAL segment has not been completed
+  yet, so Postgres archives it as a ``.partial`` file before switching to a new
+  timeline. These files represent an incomplete segment and are not suitable for
+  crash recovery on their own.
+
+  In most cases, downloading ``.partial`` files during WAL restore is harmless,
+  because Postgres knows how to handle them correctly. However, when running
+  ``barman-cloud-wal-restore`` on a cluster that has experienced a promotion, the
+  ``restore_command`` may retrieve a ``.partial`` (after renaming it without
+  the suffix) file where a complete WAL is expected.
+
+  Use ``--no-partial`` to suppress the download of ``.partial`` files in this
+  scenario, which will cause ``restore_command`` to signal to Postgres that the
+  WAL is not available, prompting it to switch to the correct timeline via a
+  timeline history file (``.history``) instead.
+
 .. important::
   On the target Postgres node, when ``pg_wal`` and the spool directory are on the 
   same filesystem, files are moved via renaming, which is faster than copying and 
@@ -42,6 +64,8 @@ calling ``--no-partial`` option.
 
 .. note::
   For GCP, only authentication with ``GOOGLE_APPLICATION_CREDENTIALS`` env is supported.
+  To use an alternative GCP universe (e.g. S3NS/T-Systems), set the
+  ``GOOGLE_CLOUD_UNIVERSE_DOMAIN`` environment variable to the desired universe domain.
 
 **Parameters**
 
@@ -83,6 +107,17 @@ calling ``--no-partial`` option.
 
 ``--no-partial``
   Do not download partial WAL files
+
+``-p`` / ``--parallel``
+  Specifies the number of WAL files to fetch in parallel. Default is ``0`` (disabled).
+  When set to a value greater than ``1``, fetches the requested WAL file along with the
+  next ``N - 1`` files simultaneously. The additional files are staged in a local spool
+  directory (see ``--spool-dir``) so that subsequent restore requests can be served
+  immediately from local storage.
+
+``--spool-dir``
+  Directory used for staging extra WALs fetched when using ``--parallel``. Default is
+  ``/var/tmp/walrestore``.
 
 **Extra options for the AWS cloud provider**
 

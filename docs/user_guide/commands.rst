@@ -60,13 +60,17 @@ quickly navigate to it.
 .. include:: commands/barman/backup.inc.rst
 .. include:: commands/barman/check_backup.inc.rst
 .. include:: commands/barman/check.inc.rst
+.. include:: commands/barman/cloud_wal_archive.inc.rst
+.. include:: commands/barman/cloud_wal_restore.inc.rst
 .. include:: commands/barman/config_switch.inc.rst
 .. include:: commands/barman/config_update.inc.rst
 .. include:: commands/barman/cron.inc.rst
 .. include:: commands/barman/delete.inc.rst
 .. include:: commands/barman/diagnose.inc.rst
+.. include:: commands/barman/export_backup.inc.rst
 .. include:: commands/barman/generate_manifest.inc.rst
 .. include:: commands/barman/get_wal.inc.rst
+.. include:: commands/barman/import_backup.inc.rst
 .. include:: commands/barman/keep.inc.rst
 .. include:: commands/barman/list_backups.inc.rst
 .. include:: commands/barman/list_files.inc.rst

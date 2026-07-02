@@ -50,6 +50,7 @@ from barman.recovery_executor import (
     ConfigurationFileMangeler,
     DecompressOperation,
     DecryptOperation,
+    DownloadOperation,
     MainRecoveryExecutor,
     RecoveryExecutor,
     RecoveryOperation,
@@ -1175,6 +1176,58 @@ class TestRecoveryExecutor(object):
         # standby_mode is not a valid configuration in PostgreSQL 12
         assert "standby_mode" not in pg_auto_conf
 
+    @mock.patch("barman.recovery_executor.open")
+    def test_generate_recovery_conf_wals_stored_in_cloud(self, _):
+        """
+        Assert that the ``restore_command`` is correctly generated with
+        ``barman cloud-wal-restore`` when `--get-wal` is ``True`` and the server is
+        configured to use WAL cloud storage.
+        """
+        # Prepare argsuments for _generate_recovery_conf
+        recovery_info = {
+            "get_wal": True,
+            "wal_dest": None,
+            "custom_restore_command": None,
+            "results": {},
+        }
+        mock_backup_info = mock.Mock(version=180000)
+        dest = "/path/to/nowhere"
+        immediate = False
+        exclusive = False
+        remote_command = None
+        target_name = None
+        target_time = None
+        target_tli = None
+        target_xid = None
+        target_lsn = None
+        standby_mode = False
+
+        # Simulate a server configured to use WAL cloud storage
+        mock_server = mock.Mock(use_wal_cloud_storage=True)
+        executor = RecoveryExecutor(mock_server)
+        executor.config = mock.Mock()
+        executor.config.name = "test-server"
+
+        # WHEN _generate_recovery_conf is called
+        executor._generate_recovery_conf(
+            recovery_info,
+            mock_backup_info,
+            dest,
+            immediate,
+            exclusive,
+            remote_command,
+            target_name,
+            target_time,
+            target_tli,
+            target_xid,
+            target_lsn,
+            standby_mode,
+        )
+
+        # THEN the restore_command should be generated with barman cloud-wal-restore
+        expected = ["restore_command = 'barman cloud-wal-restore test-server %f %p'"]
+        assert recovery_info["auto_conf_append_lines"] == expected
+
     def parse_auto_conf_lines(self, recovery_info):
         assert "auto_conf_append_lines" in recovery_info
         pg_auto_conf = {}
@@ -1299,10 +1352,15 @@ class TestRecoveryExecutor(object):
         cm_mock.return_value.identify_compression.return_value = None
         cm_mock.return_value.unidentified_compression = None
 
-        # Prepare compressors mock
+        # Prepare encryption mock — decrypt() must return the path it writes to
+        # (dest/segment_name) so that _decrypt_decompress_wal can compare it with
+        # dst_file and skip the rename when they match.
         e = {
             "gpg": mock.Mock(name="gpg"),
         }
+        e["gpg"].decrypt.side_effect = lambda file, dest, passphrase: os.path.join(
+            dest, os.path.basename(file)
+        )
         encr_mock.return_value.get_encryption = lambda encryption: e[encryption]
         mock_tmp_file.return_value = "/tmp/barman-wal-x"
         mock_copy.return_value = None
@@ -1341,8 +1399,9 @@ class TestRecoveryExecutor(object):
             dest=dest.strpath + "/",
             passphrase=b"passphrase",
         )
+        # identify_compression is called with the path returned by decrypt()
         cm_mock.return_value.identify_compression.assert_called_once_with(
-            e["gpg"].decrypt()
+            os.path.join(dest.strpath + "/", "000000000000000000000004")
         )
         mock_copy.assert_called_once_with(xlog_plain.strpath, mock.ANY)
         # Reset mock calls
@@ -1375,8 +1434,9 @@ class TestRecoveryExecutor(object):
             dest="/tmp/barman-wal-x",
             passphrase=b"passphrase",
         )
+        # identify_compression is called with the path returned by decrypt()
         cm_mock.return_value.identify_compression.assert_called_once_with(
-            e["gpg"].decrypt()
+            "/tmp/barman-wal-x/000000000000000000000004"
         )
         mock_copy.assert_called_once_with(xlog_plain.strpath, mock.ANY)
 
@@ -1548,6 +1608,503 @@ class TestRecoveryExecutor(object):
             "Encrypted WALs were found for server 'main', but "
             "'encryption_passphrase_command' is not configured correctly."
             in caplog.text
+        )
+
+    @mock.patch("barman.recovery_executor.get_passphrase_from_command")
+    @mock.patch("shutil.rmtree")
+    @mock.patch("os.unlink")
+    @mock.patch("shutil.copy2")
+    @mock.patch("tempfile.mkdtemp")
+    @mock.patch("barman.backup.EncryptionManager")
+    @mock.patch("barman.backup.CompressionManager")
+    @mock.patch("barman.recovery_executor.RsyncPgData")
+    def test_recover_xlog_with_partial_file(
+        self,
+        rsync_pg_mock,
+        cm_mock,
+        encr_mock,
+        mock_tmp_file,
+        mock_copy,
+        mock_unlink,
+        mock_rmtree,
+        mock_passphrase,
+        tmpdir,
+    ):
+        """
+        Test that .partial WAL files from the streaming directory are copied
+        during recovery with the .partial suffix stripped from the filename.
+        """
+        # Build basic folders/files structure
+        dest = tmpdir.mkdir("destination")
+        wals = tmpdir.mkdir("wals")
+        streaming = tmpdir.mkdir("streaming")
+        # Create a .partial WAL file in the streaming directory
+        partial_wal = streaming.join("000000010000000000000005.partial")
+        partial_wal.write("dummy partial content")
+        server = testing_helpers.build_real_server(
+            main_conf={
+                "wals_directory": wals.strpath,
+                "streaming_wals_directory": streaming.strpath,
+            }
+        )
+        cm_mock.return_value.get_compressor = lambda compression=None: None
+        cm_mock.return_value.identify_compression.return_value = None
+        encr_mock.return_value.get_encryption = lambda encryption: None
+        mock_tmp_file.return_value = "/tmp/barman-wal-partial-x"
+        mock_copy.return_value = None
+        # Build executor
+        executor = RecoveryExecutor(server.backup_manager)
+        # GIVEN a .partial WAL file in the streaming directory (plain — no
+        # compression, no encryption, as pg_receivewal always writes plain files)
+        required_wals = (
+            WalFileInfo.from_file(
+                partial_wal.strpath,
+                compression_manager=cm_mock.return_value,
+                unidentified_compression=None,
+                encryption_manager=encr_mock.return_value,
+                encryption=None,
+            ),
+        )
+        # WHEN _xlog_copy is called
+        executor._xlog_copy(required_wals, dest.strpath, None)
+        # THEN the .partial file is copied with its source path correct
+        mock_copy.assert_called_once_with(
+            partial_wal.strpath,
+            mock.ANY,
+        )
+        # AND the destination filename has the .partial suffix stripped
+        dst_arg = mock_copy.call_args[0][1]
+        assert not dst_arg.endswith(".partial")
+        assert dst_arg.endswith("000000010000000000000005")
+
+    @mock.patch("barman.recovery_executor.get_passphrase_from_command")
+    @mock.patch("shutil.rmtree")
+    @mock.patch("os.unlink")
+    @mock.patch("shutil.copy2")
+    @mock.patch("tempfile.mkdtemp")
+    @mock.patch("barman.backup.EncryptionManager")
+    @mock.patch("barman.backup.CompressionManager")
+    @mock.patch("barman.recovery_executor.RsyncPgData")
+    def test_recover_xlog_with_partial_file_remote(
+        self,
+        rsync_pg_mock,
+        cm_mock,
+        encr_mock,
+        mock_tmp_file,
+        mock_copy,
+        mock_unlink,
+        mock_rmtree,
+        mock_passphrase,
+        tmpdir,
+    ):
+        """
+        Test that .partial WAL files from the streaming directory are transferred
+        via rsync during a remote recovery with the .partial suffix stripped.
+        """
+        # Build basic folders/files structure
+        dest = tmpdir.mkdir("destination")
+        wals = tmpdir.mkdir("wals")
+        streaming = tmpdir.mkdir("streaming")
+        # Create a .partial WAL file in the streaming directory
+        partial_wal = streaming.join("000000010000000000000005.partial")
+        partial_wal.write("dummy partial content")
+        server = testing_helpers.build_real_server(
+            main_conf={
+                "wals_directory": wals.strpath,
+                "streaming_wals_directory": streaming.strpath,
+            }
+        )
+        cm_mock.return_value.get_compressor = lambda compression=None: None
+        cm_mock.return_value.identify_compression.return_value = None
+        encr_mock.return_value.get_encryption = lambda encryption: None
+        mock_tmp_file.return_value = "/tmp/barman-wal-partial-x"
+        mock_copy.return_value = None
+        # Build executor
+        executor = RecoveryExecutor(server.backup_manager)
+        # GIVEN a .partial WAL file in the streaming directory (plain — no
+        # compression, no encryption, as pg_receivewal always writes plain files)
+        required_wals = (
+            WalFileInfo.from_file(
+                partial_wal.strpath,
+                compression_manager=cm_mock.return_value,
+                unidentified_compression=None,
+                encryption_manager=encr_mock.return_value,
+                encryption=None,
+            ),
+        )
+        # WHEN _xlog_copy is called with a remote command
+        executor._xlog_copy(required_wals, dest.strpath, "remote_command")
+        # THEN rsync is initialized with the remote command
+        rsync_pg_mock.assert_called_once_with(
+            network_compression=False, bwlimit=None, path=mock.ANY, ssh="remote_command"
+        )
+        # AND the .partial file is copied to staging with suffix stripped
+        mock_copy.assert_called_once_with(
+            partial_wal.strpath,
+            mock.ANY,
+        )
+        # AND rsync transfers the file to the remote destination
+        rsync_pg_mock.return_value.from_file_list.assert_called_once_with(
+            ["000000010000000000000005"],
+            "/tmp/barman-wal-partial-x",
+            mock.ANY,
+        )
+        # AND staging dir is cleaned up
+        mock_rmtree.assert_called_with("/tmp/barman-wal-partial-x")
+
+    @mock.patch("barman.recovery_executor.get_passphrase_from_command")
+    @mock.patch("shutil.rmtree")
+    @mock.patch("os.unlink")
+    @mock.patch("shutil.copy2")
+    @mock.patch("tempfile.mkdtemp")
+    @mock.patch("barman.backup.EncryptionManager")
+    @mock.patch("barman.backup.CompressionManager")
+    @mock.patch("barman.recovery_executor.RsyncPgData")
+    def test_recover_xlog_with_partial_file_from_wal_archive(
+        self,
+        rsync_pg_mock,
+        cm_mock,
+        encr_mock,
+        mock_tmp_file,
+        mock_copy,
+        mock_unlink,
+        mock_rmtree,
+        mock_passphrase,
+        tmpdir,
+    ):
+        """
+        Test that a .partial WAL file from the main WAL archive is copied during
+        recovery with the .partial suffix stripped from the destination filename.
+
+        This scenario occurs when a standby is promoted and PostgreSQL calls
+        archive_command with the in-progress WAL segment, which gets archived
+        into the main WAL archive with the .partial suffix intact.
+        """
+        dest = tmpdir.mkdir("destination")
+        wals = tmpdir.mkdir("wals")
+        streaming = tmpdir.mkdir("streaming")
+        # Create the .partial WAL file in the main WAL archive under its hash dir
+        hashdir = wals.mkdir("0000000100000000")
+        partial_wal = hashdir.join("000000010000000000000005.partial")
+        partial_wal.write("dummy partial content")
+        server = testing_helpers.build_real_server(
+            main_conf={
+                "wals_directory": wals.strpath,
+                "streaming_wals_directory": streaming.strpath,
+            }
+        )
+        cm_mock.return_value.get_compressor = lambda compression=None: None
+        encr_mock.return_value.get_encryption = lambda encryption: None
+        mock_tmp_file.return_value = "/tmp/barman-wal-partial-x"
+        mock_copy.return_value = None
+        executor = RecoveryExecutor(server.backup_manager)
+        # GIVEN a .partial WAL file from xlogdb (no orig_filename pointing to
+        # the streaming directory)
+        required_wals = (
+            WalFileInfo.from_xlogdb_line(
+                "000000010000000000000005.partial\t16777216\t1776180247.8\tNone\tNone\n"
+            ),
+        )
+        # WHEN _xlog_copy is called
+        executor._xlog_copy(required_wals, dest.strpath, None)
+        # THEN the .partial file is copied from the main WAL archive
+        mock_copy.assert_called_once_with(
+            partial_wal.strpath,
+            mock.ANY,
+        )
+        # AND the destination filename has the .partial suffix stripped
+        dst_arg = mock_copy.call_args[0][1]
+        assert not dst_arg.endswith(".partial")
+        assert dst_arg.endswith("000000010000000000000005")
+
+    @mock.patch("barman.recovery_executor.get_passphrase_from_command")
+    @mock.patch("shutil.rmtree")
+    @mock.patch("os.unlink")
+    @mock.patch("shutil.copy2")
+    @mock.patch("tempfile.mkdtemp")
+    @mock.patch("barman.backup.EncryptionManager")
+    @mock.patch("barman.backup.CompressionManager")
+    @mock.patch("barman.recovery_executor.RsyncPgData")
+    def test_recover_xlog_with_compressed_partial_file_from_wal_archive(
+        self,
+        rsync_pg_mock,
+        cm_mock,
+        encr_mock,
+        mock_tmp_file,
+        mock_copy,
+        mock_unlink,
+        mock_rmtree,
+        mock_passphrase,
+        tmpdir,
+    ):
+        """
+        Test that a compressed .partial WAL file from the main WAL archive is
+        decompressed during recovery with the .partial suffix stripped.
+
+        barman cron compresses WAL files (including .partial ones archived during
+        standby promotion) when the server has compression configured. The restore
+        must decompress the file before writing it to the destination so that
+        PostgreSQL can read it.
+        """
+        dest = tmpdir.mkdir("destination")
+        wals = tmpdir.mkdir("wals")
+        streaming = tmpdir.mkdir("streaming")
+        # Create the compressed .partial WAL file in the main WAL archive
+        hashdir = wals.mkdir("0000000100000000")
+        partial_wal = hashdir.join("000000010000000000000005.partial")
+        partial_wal.write("compressed dummy content")
+        server = testing_helpers.build_real_server(
+            main_conf={
+                "wals_directory": wals.strpath,
+                "streaming_wals_directory": streaming.strpath,
+            }
+        )
+        mock_compressor = mock.MagicMock()
+        cm_mock.return_value.get_compressor = mock.MagicMock(
+            return_value=mock_compressor
+        )
+        encr_mock.return_value.get_encryption = lambda encryption: None
+        mock_tmp_file.return_value = "/tmp/barman-wal-partial-x"
+        executor = RecoveryExecutor(server.backup_manager)
+        # GIVEN a compressed .partial WAL file from xlogdb
+        required_wals = (
+            WalFileInfo.from_xlogdb_line(
+                "000000010000000000000005.partial\t16777216\t1776180247.8\tgzip\tNone\n"
+            ),
+        )
+        # WHEN _xlog_copy is called
+        executor._xlog_copy(required_wals, dest.strpath, None)
+        # THEN decompress is called (not shutil.copy2) with the correct source
+        mock_compressor.decompress.assert_called_once_with(
+            partial_wal.strpath,
+            mock.ANY,
+        )
+        mock_copy.assert_not_called()
+        # AND the destination filename has the .partial suffix stripped
+        dst_arg = mock_compressor.decompress.call_args[0][1]
+        assert not dst_arg.endswith(".partial")
+        assert dst_arg.endswith("000000010000000000000005")
+
+    @mock.patch("barman.recovery_executor.get_passphrase_from_command")
+    @mock.patch("shutil.rmtree")
+    @mock.patch("shutil.move")
+    @mock.patch("os.unlink")
+    @mock.patch("shutil.copy2")
+    @mock.patch("tempfile.mkdtemp")
+    @mock.patch("barman.backup.EncryptionManager")
+    @mock.patch("barman.backup.CompressionManager")
+    @mock.patch("barman.recovery_executor.RsyncPgData")
+    def test_recover_xlog_with_encrypted_partial_file_from_wal_archive(
+        self,
+        rsync_pg_mock,
+        cm_mock,
+        encr_mock,
+        mock_tmp_file,
+        mock_copy,
+        mock_unlink,
+        mock_move,
+        mock_rmtree,
+        mock_passphrase,
+        tmpdir,
+    ):
+        """
+        Test that an encrypted .partial WAL file from the main WAL archive is
+        decrypted during recovery with the .partial suffix stripped.
+
+        barman cron encrypts WAL files (including .partial ones archived during
+        standby promotion) when the server has encryption configured. The restore
+        must decrypt the file before writing it to the destination so that
+        PostgreSQL can read it.
+        """
+        dest = tmpdir.mkdir("destination")
+        wals = tmpdir.mkdir("wals")
+        streaming = tmpdir.mkdir("streaming")
+        # Create the encrypted .partial WAL file in the main WAL archive
+        hashdir = wals.mkdir("0000000100000000")
+        partial_wal = hashdir.join("000000010000000000000005.partial")
+        partial_wal.write("encrypted dummy content")
+        server = testing_helpers.build_real_server(
+            main_conf={
+                "wals_directory": wals.strpath,
+                "streaming_wals_directory": streaming.strpath,
+                "encryption_passphrase_command": "echo 'passphrase'",
+            }
+        )
+        partial_staging_dir = "/tmp/barman-wal-partial-x"
+        # decrypt() returns a path that still carries the .partial suffix,
+        # so the code must rename it to the suffix-stripped dst_file.
+        decrypted_path = partial_staging_dir + "/000000010000000000000005.partial"
+        mock_encryptor = mock.MagicMock()
+        mock_encryptor.decrypt.return_value = decrypted_path
+        encr_mock.return_value.get_encryption = lambda encryption: mock_encryptor
+        cm_mock.return_value.get_compressor = lambda compression=None: None
+        cm_mock.return_value.identify_compression.return_value = None
+        cm_mock.return_value.unidentified_compression = None
+        mock_tmp_file.return_value = partial_staging_dir
+        mock_passphrase.return_value = b"passphrase"
+        executor = RecoveryExecutor(server.backup_manager)
+        # GIVEN an encrypted .partial WAL file from xlogdb (encryption=gpg, no compression)
+        required_wals = (
+            WalFileInfo.from_xlogdb_line(
+                "000000010000000000000005.partial\t16777216\t1776180247.8\tNone\tgpg\n"
+            ),
+        )
+        # WHEN _xlog_copy is called
+        executor._xlog_copy(required_wals, dest.strpath, None)
+        # THEN decrypt is called with the correct source and staging dir
+        mock_encryptor.decrypt.assert_called_once_with(
+            file=partial_wal.strpath,
+            dest=partial_staging_dir,
+            passphrase=b"passphrase",
+        )
+        # AND compression is checked on the decrypted output
+        cm_mock.return_value.identify_compression.assert_called_once_with(
+            decrypted_path
+        )
+        # AND no plain copy or decompression is performed
+        mock_copy.assert_not_called()
+        # AND the decrypted file is moved to dst_file with the .partial suffix stripped
+        dst_file = partial_staging_dir + "/000000010000000000000005"
+        mock_move.assert_any_call(decrypted_path, dst_file)
+        assert not dst_file.endswith(".partial")
+        assert dst_file.endswith("000000010000000000000005")
+
+    @mock.patch("os.unlink")
+    @mock.patch("barman.recovery_executor.RsyncPgData")
+    def test_rsync_move_files_success(
+        self,
+        rsync_pg_mock,
+        mock_unlink,
+        tmpdir,
+    ):
+        """
+        Test that _rsync_move_files transfers files and cleans up after success.
+        """
+        server = testing_helpers.build_real_server()
+        executor = RecoveryExecutor(server.backup_manager)
+        rsync = rsync_pg_mock.return_value
+        # GIVEN a list of files to transfer
+        file_list = ["000000010000000000000001", "000000010000000000000002"]
+        src_dir = "/tmp/src"
+        dst_dir = "/tmp/dst"
+        # WHEN _rsync_move_files is called
+        executor._rsync_move_files(rsync, file_list, src_dir, dst_dir)
+        # THEN rsync transfers the files
+        rsync.from_file_list.assert_called_once_with(file_list, src_dir, dst_dir)
+        # AND files are cleaned up from src_dir
+        mock_unlink.assert_any_call("/tmp/src/000000010000000000000001")
+        mock_unlink.assert_any_call("/tmp/src/000000010000000000000002")
+
+    @mock.patch("os.unlink")
+    @mock.patch("barman.recovery_executor.RsyncPgData")
+    def test_rsync_move_files_transfer_failure(
+        self,
+        rsync_pg_mock,
+        mock_unlink,
+        tmpdir,
+    ):
+        """
+        Test that _rsync_move_files raises DataTransferFailure when rsync fails.
+        """
+        server = testing_helpers.build_real_server()
+        executor = RecoveryExecutor(server.backup_manager)
+        rsync = rsync_pg_mock.return_value
+        rsync.from_file_list.side_effect = CommandFailedException(
+            {"ret": 1, "out": "", "err": "error"}
+        )
+        # WHEN _rsync_move_files is called and rsync fails
+        # THEN DataTransferFailure is raised
+        with pytest.raises(DataTransferFailure):
+            executor._rsync_move_files(
+                rsync, ["000000010000000000000001"], "/tmp/src", "/tmp/dst"
+            )
+
+    @mock.patch("os.unlink", side_effect=OSError("Permission denied"))
+    @mock.patch("barman.recovery_executor.RsyncPgData")
+    def test_rsync_move_files_cleanup_failure(
+        self,
+        rsync_pg_mock,
+        mock_unlink,
+        tmpdir,
+        capsys,
+    ):
+        """
+        Test that _rsync_move_files issues a warning when cleanup fails.
+        """
+        server = testing_helpers.build_real_server()
+        executor = RecoveryExecutor(server.backup_manager)
+        rsync = rsync_pg_mock.return_value
+        # WHEN _rsync_move_files is called and cleanup fails
+        executor._rsync_move_files(
+            rsync, ["000000010000000000000001"], "/tmp/src", "/tmp/dst"
+        )
+        # THEN a warning is issued
+        _out, err = capsys.readouterr()
+        assert "Error removing temporary file" in err
+
+    @mock.patch("barman.output.warning")
+    @mock.patch.object(RecoveryExecutor, "_set_pitr_targets", side_effect=StopIteration)
+    @mock.patch.object(RecoveryExecutor, "_setup")
+    def test_recover_warns_when_partial_and_get_wal(
+        self, mock_setup, _mock_set_pitr_targets, mock_warning
+    ):
+        """
+        Test that a warning is issued when --partial-wal is used with get-wal
+        mode, since the flag has no effect in that code path.
+        """
+        # GIVEN a recovery executor
+        server = testing_helpers.build_real_server()
+        executor = RecoveryExecutor(server.backup_manager)
+        backup_info = testing_helpers.build_test_backup_info()
+        # AND _setup reports that get-wal mode is active
+        mock_setup.return_value = {
+            "get_wal": True,
+            "recovery_dest": "local",
+            "results": {"get_wal": False, "warnings": []},
+        }
+
+        # WHEN recover is called with copy_partial=True
+        with pytest.raises(StopIteration):
+            executor.recover(backup_info, "/dest", copy_partial=True)
+
+        # THEN a warning is issued explaining that --partial-wal is ignored
+        mock_warning.assert_any_call(
+            "The --partial-wal option was ignored as it only works "
+            "with --no-get-wal."
+        )
+
+    @mock.patch("barman.output.warning")
+    @mock.patch.object(RecoveryExecutor, "_set_pitr_targets", side_effect=StopIteration)
+    @mock.patch.object(RecoveryExecutor, "_setup")
+    def test_recover_warns_when_partial_and_target_immediate(
+        self, mock_setup, _mock_set_pitr_targets, mock_warning
+    ):
+        """
+        Test that a warning is issued when --partial-wal is used with
+        --target-immediate, since no partial files are ever searched for in
+        that code path.
+        """
+        # GIVEN a recovery executor
+        server = testing_helpers.build_real_server()
+        executor = RecoveryExecutor(server.backup_manager)
+        backup_info = testing_helpers.build_test_backup_info()
+        # AND _setup reports that get-wal mode is NOT active
+        mock_setup.return_value = {
+            "get_wal": False,
+            "recovery_dest": "local",
+            "results": {"get_wal": False, "warnings": []},
+        }
+
+        # WHEN recover is called with copy_partial=True and target_immediate=True
+        with pytest.raises(StopIteration):
+            executor.recover(
+                backup_info, "/dest", copy_partial=True, target_immediate=True
+            )
+
+        # THEN a warning is issued explaining that --partial-wal is ignored
+        mock_warning.assert_any_call(
+            "The --partial-wal option was ignored as it has no effect "
+            "with --target-immediate."
         )
 
     @mock.patch("barman.recovery_executor.RsyncCopyController")
@@ -3238,6 +3795,305 @@ class TestRecoveryOperation(object):
         assert operation.staging_path in args
 
 
+class TestDownloadOperation(object):
+    """
+    Tests for the :class:`DownloadOperation` class.
+    """
+
+    @pytest.mark.parametrize("use_backup_cloud_storage", [True, False])
+    def test_should_execute(self, use_backup_cloud_storage):
+        # GIVEN a DownloadOperation instance
+        operation = DownloadOperation(
+            config=mock.Mock(),
+            server=mock.Mock(use_backup_cloud_storage=use_backup_cloud_storage),
+            backup_manager=mock.Mock(),
+        )
+        # WHEN _should_execute is called
+        mock_backup_info = mock.Mock()
+        # THEN it returns True if backup cloud storage is in use, False otherwise
+        assert operation._should_execute(mock_backup_info) == use_backup_cloud_storage
+
+    def test_execute(self):
+        # GIVEN a DownloadOperation instance
+        operation = DownloadOperation(
+            config=mock.Mock(),
+            server=mock.Mock(),
+            backup_manager=mock.Mock(),
+        )
+        operation._execute_on_chain = mock.Mock()
+
+        args = [
+            "backup_info",
+            "destination",
+            "tablespaces",
+            "remote_command",
+            "recovery_info",
+            "safe_horizon",
+            "is_last_operation",
+        ]
+        # WHEN _execute is called
+        operation._execute(*args)
+        # THEN _execute_on_chain is called with the correct parameters
+        operation._execute_on_chain.assert_called_once_with(
+            "backup_info",
+            "destination",
+            operation._download_backup,
+            "tablespaces",
+            "is_last_operation",
+        )
+
+    @pytest.mark.parametrize("is_last_operation", [True, False])
+    @mock.patch(
+        "barman.recovery_executor.DownloadOperation._create_volatile_backup_info"
+    )
+    @mock.patch("barman.recovery_executor.DownloadOperation._get_tablespace_mapping")
+    @mock.patch("barman.recovery_executor.CloudBackupCatalog")
+    @mock.patch("barman.recovery_executor.DownloadOperation._link_tablespaces")
+    def test_download_backup(
+        self,
+        mock_link_tablespaces,
+        mock_cloud_backup_catalog,
+        mock_get_tablespace_mapping,
+        mock_create_volatile_backup_info,
+        is_last_operation,
+    ):
+        """
+        Test that :meth:`_download_backup` downloads the backup files from the cloud to
+        the respective destinations and links the tablespaces correctly.
+
+        .. note::
+            In this test, we simulate the most complete case where there are additional
+            files for both pgdata and tablespaces are present. Also test with different
+            values of ``is_last_operation`` for completeness.
+        """
+        # Prepare mocks
+        # Simulate a server with a cloud interface
+        mock_cloud_interface = mock.Mock()
+        server = mock.Mock(get_backup_cloud_interface=lambda: mock_cloud_interface)
+
+        # Simulate a config with a name for the cloud backup catalog
+        config = mock.Mock()
+        config.name = "server-name"
+
+        # Simulate a volatile backup info representing the backup being downloaded
+        # Note: its data directory is only used when this is not the last operation
+        mock_vol_backup_info = mock.Mock(
+            get_data_directory=lambda: "/staging/barman-download2323/backup_id/data"
+        )
+        mock_create_volatile_backup_info.return_value = mock_vol_backup_info
+
+        # Simulate a cloud backup catalog with backup files for pgdata and tablespaces
+        # Note: we simulate pgdata and tbspc having additional files because this is
+        # the most complete case so by asserting this we are also asserting simpler cases
+        pgdata_file_info2 = mock.Mock(path="/cloud/path/data_001.tar")
+        pgdata_file_info = mock.Mock(
+            path="/cloud/path/data.tar", additional_files=[pgdata_file_info2]
+        )
+        tbspc_file_info2 = mock.Mock(path="/cloud/path/12345_001.tar")
+        tbspc_file_info = mock.Mock(
+            path="/cloud/path/12345.tar", additional_files=[tbspc_file_info2]
+        )
+        ret_backup_files = {None: pgdata_file_info, "12345": tbspc_file_info}
+        mock_cloud_backup_catalog.return_value.get_backup_files.return_value = (
+            ret_backup_files
+        )
+
+        # Simulate tablespace being remapped to the following location
+        ret_tbspc_mapping = {
+            "/cloud/path/12345.tar": "/path/to/tbs1",
+            "/cloud/path/12345_001.tar": "/path/to/tbs1",
+        }
+        mock_get_tablespace_mapping.return_value = ret_tbspc_mapping
+
+        # GIVEN a DownloadOperation instance
+        operation = DownloadOperation(
+            config=config,
+            server=server,
+            backup_manager=mock.Mock(),
+        )
+
+        # WHEN _download_backup is called with the following parameters
+        mock_backup_info, destination, tablespaces = (
+            mock.Mock(),
+            "/fake/pgdata/destination",
+            {"tbs1": "/path/to/tbs1"},
+        )
+        operation._download_backup(
+            mock_backup_info, destination, tablespaces, is_last_operation
+        )
+
+        # THEN a volatile backup info is created correctly
+        mock_create_volatile_backup_info.assert_called_once_with(
+            mock_backup_info, destination
+        )
+        vol_backup_info = mock_create_volatile_backup_info.return_value
+
+        # AND a cloud backup catalog is instantiated correctly
+        mock_cloud_backup_catalog.assert_called_once_with(
+            mock_cloud_interface, "server-name"
+        )
+        ret_mock_cloud_catalog = mock_cloud_backup_catalog.return_value
+
+        # AND the backup files are retrieved from the cloud backup instance
+        ret_mock_cloud_catalog.get_backup_files.assert_called_once_with(
+            mock_backup_info
+        )
+
+        # AND the tablespace mappings are retrieved correctly
+        mock_get_tablespace_mapping.assert_called_once_with(
+            mock_backup_info,
+            vol_backup_info,
+            tablespaces,
+            ret_backup_files,
+            is_last_operation,
+        )
+
+        # AND finally the pgdata and tablespaces files are downloaded
+        # from the cloud to their respective destinations
+        expected_pgdata_dest = destination
+        if not is_last_operation:
+            expected_pgdata_dest = "/staging/barman-download2323/backup_id/data"
+        mock_cloud_interface.extract_tar.assert_has_calls(
+            [
+                mock.call("/cloud/path/data.tar", expected_pgdata_dest),
+                mock.call("/cloud/path/data_001.tar", expected_pgdata_dest),
+                mock.call("/cloud/path/12345.tar", "/path/to/tbs1"),
+                mock.call("/cloud/path/12345_001.tar", "/path/to/tbs1"),
+            ]
+        )
+
+        # AND lastly the tablespaces are linked in pg_tblspc
+        mock_link_tablespaces.assert_called_once_with(
+            vol_backup_info, expected_pgdata_dest, tablespaces, is_last_operation
+        )
+
+    @pytest.mark.parametrize(
+        "is_last_operation, tablespaces_relocation, expected_result",
+        [
+            # Case 1: Last operation, no relocation
+            # Tablespaces go from the cloud path to their original location on the server
+            (
+                True,
+                None,
+                {
+                    "/cloud/path/12345.tar": "/path/on/server/tbs1",
+                    "/cloud/path/12345_001.tar": "/path/on/server/tbs1",
+                    "/cloud/path/54321.tar": "/path/on/server/tbs2",
+                    "/cloud/path/54321_001.tar": "/path/on/server/tbs2",
+                },
+            ),
+            # Case 2: Not last operation, no relocation
+            # Tablespaces go from the cloud path to the volatile backup respective directory
+            (
+                False,
+                None,
+                {
+                    "/cloud/path/12345.tar": "/staging/download123/backup_id/12345",
+                    "/cloud/path/12345_001.tar": "/staging/download123/backup_id/12345",
+                    "/cloud/path/54321.tar": "/staging/download123/backup_id/54321",
+                    "/cloud/path/54321_001.tar": "/staging/download123/backup_id/54321",
+                },
+            ),
+            # Case 3: Last operation, with relocation
+            # Tablespaces go from the cloud path backup to the relocation path
+            (
+                True,
+                {"tbs1": "/path/to/relocation", "tbs2": "/path/to/relocation2"},
+                {
+                    "/cloud/path/12345.tar": "/path/to/relocation",
+                    "/cloud/path/12345_001.tar": "/path/to/relocation",
+                    "/cloud/path/54321.tar": "/path/to/relocation2",
+                    "/cloud/path/54321_001.tar": "/path/to/relocation2",
+                },
+            ),
+            # Case 4: Not last operation, with relocation
+            # Tablespaces go from the cloud path to the volatile backup respective directory
+            (
+                False,
+                {"tbs1": "/path/to/relocation", "tbs2": "/path/to/relocation2"},
+                {
+                    "/cloud/path/12345.tar": "/staging/download123/backup_id/12345",
+                    "/cloud/path/12345_001.tar": "/staging/download123/backup_id/12345",
+                    "/cloud/path/54321.tar": "/staging/download123/backup_id/54321",
+                    "/cloud/path/54321_001.tar": "/staging/download123/backup_id/54321",
+                },
+            ),
+        ],
+    )
+    def test_get_tablespace_mapping(
+        self,
+        is_last_operation,
+        tablespaces_relocation,
+        expected_result,
+    ):
+        """
+        Test that :meth:`_get_tablespace_mapping` returns the correct mapping of
+        tablespace files to their respective destinations.
+
+        .. note::
+            We test different values of ``is_last_operation`` and with/without
+            relocation of tablesapces for completeness. We also simulate files
+            for both pgdata and tablespaces having additional files as this is the
+            most complete case, so by asserting this we are also asserting simpler
+            cases.
+        """
+        # Prepare mocks
+        # Simulate a backup with two tablespaces to be restored
+        tbspc1 = mock.Mock(oid=12345, location="/path/on/server/tbs1")
+        tbspc1.name = "tbs1"
+        tbspc2 = mock.Mock(oid=54321, location="/path/on/server/tbs2")
+        tbspc2.name = "tbs2"
+        backup_info = mock.Mock(tablespaces=[tbspc1, tbspc2])
+
+        # Mock its respective volatile backup info
+        vol_backup_info = mock.Mock(
+            get_data_directory=lambda oid: f"/staging/download123/backup_id/{oid}",
+        )
+
+        # Mock the backup info files (as returned by the
+        # CloudBackupCatalog.get_backup_files method)
+        # We simulate that both pgdata and tablespaces have additional files as this is
+        # the most complete case, so by asserting this we are also asserting simpler cases
+        pgdata_file_info2 = mock.Mock(path="/cloud/path/data_001.tar")
+        pgdata_file_info = mock.Mock(
+            path="/cloud/path/data.tar", additional_files=[pgdata_file_info2]
+        )
+
+        tbspc1_file_info2 = mock.Mock(path="/cloud/path/12345_001.tar")
+        tbspc1_file_info1 = mock.Mock(
+            path="/cloud/path/12345.tar", additional_files=[tbspc1_file_info2]
+        )
+
+        tbspc2_file_info2 = mock.Mock(path="/cloud/path/54321_001.tar")
+        tbspc2_file_info1 = mock.Mock(
+            path="/cloud/path/54321.tar", additional_files=[tbspc2_file_info2]
+        )
+        backup_files = {
+            None: pgdata_file_info,
+            12345: tbspc1_file_info1,
+            54321: tbspc2_file_info1,
+        }
+
+        # GIVEN a CombineOperation instance
+        operation = DownloadOperation(
+            config=mock.Mock(),
+            server=mock.Mock(),
+            backup_manager=mock.Mock(),
+        )
+
+        # WHEN _get_tablespace_mapping is called
+        ret = operation._get_tablespace_mapping(
+            backup_info,
+            vol_backup_info,
+            tablespaces_relocation,
+            backup_files,
+            is_last_operation,
+        )
+
+        # THEN the mapping is correct
+        assert ret == expected_result
+
+
 class TestRsyncCopyOperation(object):
     """
     Tests for the :class:`RsyncCopyOperation` class.
@@ -3904,6 +4760,67 @@ class TestCombineOperation(object):
             mock_command.return_value.assert_called_once_with(
                 mock_full_command_quote.return_value
             )
+
+    @pytest.mark.parametrize(
+        "pg_combinebackup_version, expected_copy_mode",
+        [("18.0.0", "link"), ("17.0.0", "copy")],
+    )
+    @mock.patch("barman.recovery_executor.get_major_version", new=lambda x: x)
+    @mock.patch("barman.recovery_executor.CombineOperation._fetch_remote_status")
+    @mock.patch(
+        "barman.recovery_executor.CombineOperation._get_backup_chain_paths",
+        return_value=["/path/to/backup_id/data", "/path/to/backup_id/parent/data"],
+    )
+    @mock.patch("barman.recovery_executor.PgCombineBackup")
+    def test_run_pg_combinebackup_from_cloud_automatically_sets_link_mode_when_possible(
+        self,
+        mock_pg_combine_backup,
+        mock_get_backup_chain_paths,
+        mock_fetch_remote_status,
+        pg_combinebackup_version,
+        expected_copy_mode,
+    ):
+        """
+        Assert that ``combine_mode`` is set to ``link`` automatically whenever
+        combining backups from a cloud storage and the version of ``pg_combinebackup``
+        is 18.0.0 or higher.
+        """
+        # Prepare mocks
+        # Simulate the pg_combinebackup binary being as follows
+        mock_fetch_remote_status.return_value = {
+            "pg_combinebackup_path": "/path/to/pg_combinebackup",
+            "pg_combinebackup_version": pg_combinebackup_version,
+        }
+
+        # GIVEN a CombineOperation instance
+        operation = CombineOperation(
+            config=mock.Mock(combine_mode="copy"),  # default
+            server=mock.Mock(),
+            backup_manager=mock.Mock(),
+        )
+
+        # Build the method parameters
+        destination = "/path/to/destination"
+        backup_info = mock.Mock()
+        backup_info.pg_major_version.return_value = pg_combinebackup_version
+
+        # WHEN _run_pg_combinebackup is called
+        operation._run_pg_combinebackup(backup_info, destination, None, None)
+
+        # THEN PgCombineBackup is instantiated with the appropriate combine mode
+        remote_status = mock_fetch_remote_status.return_value
+        backups_chain = mock_get_backup_chain_paths.return_value
+        mock_pg_combine_backup.assert_called_once_with(
+            destination=destination,
+            copy_mode=expected_copy_mode,
+            command=remote_status["pg_combinebackup_path"],
+            version=remote_status["pg_combinebackup_version"],
+            app_name=None,
+            tbs_mapping=None,
+            out_handler=mock.ANY,
+            args=backups_chain,
+            skip_path_check=True,
+        )
 
     @pytest.mark.parametrize("staging_location", ["local", "remote"])
     @mock.patch(
@@ -4665,209 +5582,323 @@ class TestMainRecoveryExecutor(object):
         # staging_location is "remote" because this not a valid combination
         # and it's blocked directly in the CLI, so such cases will never
         # arrive to this method. Besides that, every combination is tested
-        "is_remote_recovery, staging_location, is_incremental, any_compressed, any_encrypted, expected_operations",
+        "is_remote_recovery, staging_location, is_incremental, any_compressed, any_encrypted, use_cloud_storage, expected_operations",
         [
             (
-                False,
-                "local",
-                False,
-                False,
-                False,
-                [RsyncCopyOperation],
+                False,  # is_remote_recovery
+                "local",  # staging_location
+                False,  # is_incremental
+                False,  # any_compressed
+                False,  # any_encrypted
+                False,  # use_cloud_storage
+                [RsyncCopyOperation],  # expected_operations
             ),
             (
-                True,
-                "local",
-                False,
-                False,
-                False,
-                [RsyncCopyOperation],
+                True,  # is_remote_recovery
+                "local",  # staging_location
+                False,  # is_incremental
+                False,  # any_compressed
+                False,  # any_encrypted
+                False,  # use_cloud_storage
+                [RsyncCopyOperation],  # expected_operations
             ),
             (
-                False,
-                "local",
-                False,
-                False,
-                True,
-                [DecryptOperation],
+                False,  # is_remote_recovery
+                "local",  # staging_location
+                False,  # is_incremental
+                False,  # any_compressed
+                True,  # any_encrypted
+                False,  # use_cloud_storage
+                [DecryptOperation],  # expected_operations
             ),
             (
-                True,
-                "local",
-                False,
-                False,
-                True,
-                [DecryptOperation, RsyncCopyOperation],
+                True,  # is_remote_recovery
+                "local",  # staging_location
+                False,  # is_incremental
+                False,  # any_compressed
+                True,  # any_encrypted
+                False,  # use_cloud_storage
+                [DecryptOperation, RsyncCopyOperation],  # expected_operations
             ),
             (
-                False,
-                "local",
-                True,
-                False,
-                False,
-                [CombineOperation],
+                False,  # is_remote_recovery
+                "local",  # staging_location
+                True,  # is_incremental
+                False,  # any_compressed
+                False,  # any_encrypted
+                False,  # use_cloud_storage
+                [CombineOperation],  # expected_operations
             ),
             (
-                True,
-                "local",
-                True,
-                False,
-                False,
-                [CombineOperation, RsyncCopyOperation],
+                True,  # is_remote_recovery
+                "local",  # staging_location
+                True,  # is_incremental
+                False,  # any_compressed
+                False,  # any_encrypted
+                False,  # use_cloud_storage
+                [CombineOperation, RsyncCopyOperation],  # expected_operations
             ),
             (
-                False,
-                "local",
-                True,
-                False,
-                True,
-                [DecryptOperation, CombineOperation],
+                False,  # is_remote_recovery
+                "local",  # staging_location
+                True,  # is_incremental
+                False,  # any_compressed
+                True,  # any_encrypted
+                False,  # use_cloud_storage
+                [DecryptOperation, CombineOperation],  # expected_operations
             ),
             (
-                True,
-                "local",
-                True,
-                False,
-                True,
-                [DecryptOperation, CombineOperation, RsyncCopyOperation],
+                True,  # is_remote_recovery
+                "local",  # staging_location
+                True,  # is_incremental
+                False,  # any_compressed
+                True,  # any_encrypted
+                False,  # use_cloud_storage
+                [
+                    DecryptOperation,
+                    CombineOperation,
+                    RsyncCopyOperation,
+                ],  # expected_operations
             ),
             (
-                False,
-                "local",
-                True,
-                True,
-                False,
-                [DecompressOperation, CombineOperation],
+                False,  # is_remote_recovery
+                "local",  # staging_location
+                True,  # is_incremental
+                True,  # any_compressed
+                False,  # any_encrypted
+                False,  # use_cloud_storage
+                [DecompressOperation, CombineOperation],  # expected_operations
             ),
             (
-                True,
-                "local",
-                True,
-                True,
-                False,
-                [DecompressOperation, CombineOperation, RsyncCopyOperation],
+                True,  # is_remote_recovery
+                "local",  # staging_location
+                True,  # is_incremental
+                True,  # any_compressed
+                False,  # any_encrypted
+                False,  # use_cloud_storage
+                [
+                    DecompressOperation,
+                    CombineOperation,
+                    RsyncCopyOperation,
+                ],  # expected_operations
             ),
             (
-                False,
-                "local",
-                True,
-                True,
-                True,
-                [DecryptOperation, DecompressOperation, CombineOperation],
+                False,  # is_remote_recovery
+                "local",  # staging_location
+                True,  # is_incremental
+                True,  # any_compressed
+                True,  # any_encrypted
+                False,  # use_cloud_storage
+                [
+                    DecryptOperation,
+                    DecompressOperation,
+                    CombineOperation,
+                ],  # expected_operations
             ),
             (
-                True,
-                "local",
-                True,
-                True,
-                True,
+                True,  # is_remote_recovery
+                "local",  # staging_location
+                True,  # is_incremental
+                True,  # any_compressed
+                True,  # any_encrypted
+                False,  # use_cloud_storage
                 [
                     DecryptOperation,
                     DecompressOperation,
                     CombineOperation,
                     RsyncCopyOperation,
-                ],
+                ],  # expected_operations
             ),
             (
-                False,
-                "local",
-                False,
-                True,
-                False,
-                [DecompressOperation],
+                False,  # is_remote_recovery
+                "local",  # staging_location
+                False,  # is_incremental
+                True,  # any_compressed
+                False,  # any_encrypted
+                False,  # use_cloud_storage
+                [DecompressOperation],  # expected_operations
             ),
             (
-                True,
-                "local",
-                False,
-                True,
-                False,
-                [DecompressOperation, RsyncCopyOperation],
+                True,  # is_remote_recovery
+                "local",  # staging_location
+                False,  # is_incremental
+                True,  # any_compressed
+                False,  # any_encrypted
+                False,  # use_cloud_storage
+                [DecompressOperation, RsyncCopyOperation],  # expected_operations
             ),
             (
-                False,
-                "local",
-                False,
-                True,
-                True,
-                [DecryptOperation, DecompressOperation],
+                False,  # is_remote_recovery
+                "local",  # staging_location
+                False,  # is_incremental
+                True,  # any_compressed
+                True,  # any_encrypted
+                False,  # use_cloud_storage
+                [DecryptOperation, DecompressOperation],  # expected_operations
             ),
             (
-                True,
-                "local",
-                False,
-                True,
-                True,
-                [DecryptOperation, DecompressOperation, RsyncCopyOperation],
+                True,  # is_remote_recovery
+                "local",  # staging_location
+                False,  # is_incremental
+                True,  # any_compressed
+                True,  # any_encrypted
+                False,  # use_cloud_storage
+                [
+                    DecryptOperation,
+                    DecompressOperation,
+                    RsyncCopyOperation,
+                ],  # expected_operations
             ),
             (
-                True,
-                "remote",
-                False,
-                False,
-                False,
-                [RsyncCopyOperation],
+                True,  # is_remote_recovery
+                "remote",  # staging_location
+                False,  # is_incremental
+                False,  # any_compressed
+                False,  # any_encrypted
+                False,  # use_cloud_storage
+                [RsyncCopyOperation],  # expected_operations
             ),
             (
-                True,
-                "remote",
-                False,
-                False,
-                True,
-                [DecryptOperation, RsyncCopyOperation],
+                True,  # is_remote_recovery
+                "remote",  # staging_location
+                False,  # is_incremental
+                False,  # any_compressed
+                True,  # any_encrypted
+                False,  # use_cloud_storage
+                [DecryptOperation, RsyncCopyOperation],  # expected_operations
             ),
             (
-                True,
-                "remote",
-                True,
-                False,
-                False,
-                [RsyncCopyOperation, CombineOperation],
+                True,  # is_remote_recovery
+                "remote",  # staging_location
+                True,  # is_incremental
+                False,  # any_compressed
+                False,  # any_encrypted
+                False,  # use_cloud_storage
+                [RsyncCopyOperation, CombineOperation],  # expected_operations
             ),
             (
-                True,
-                "remote",
-                True,
-                False,
-                True,
-                [DecryptOperation, RsyncCopyOperation, CombineOperation],
+                True,  # is_remote_recovery
+                "remote",  # staging_location
+                True,  # is_incremental
+                False,  # any_compressed
+                True,  # any_encrypted
+                False,  # use_cloud_storage
+                [
+                    DecryptOperation,
+                    RsyncCopyOperation,
+                    CombineOperation,
+                ],  # expected_operations
             ),
             (
-                True,
-                "remote",
-                True,
-                True,
-                False,
-                [RsyncCopyOperation, DecompressOperation, CombineOperation],
+                True,  # is_remote_recovery
+                "remote",  # staging_location
+                True,  # is_incremental
+                True,  # any_compressed
+                False,  # any_encrypted
+                False,  # use_cloud_storage
+                [
+                    RsyncCopyOperation,
+                    DecompressOperation,
+                    CombineOperation,
+                ],  # expected_operations
             ),
             (
-                True,
-                "remote",
-                True,
-                True,
-                True,
+                True,  # is_remote_recovery
+                "remote",  # staging_location
+                True,  # is_incremental
+                True,  # any_compressed
+                True,  # any_encrypted
+                False,  # use_cloud_storage
                 [
                     DecryptOperation,
                     RsyncCopyOperation,
                     DecompressOperation,
                     CombineOperation,
-                ],
+                ],  # expected_operations
             ),
             (
-                True,
-                "remote",
-                False,
-                True,
-                False,
-                [RsyncCopyOperation, DecompressOperation],
+                True,  # is_remote_recovery
+                "remote",  # staging_location
+                False,  # is_incremental
+                True,  # any_compressed
+                False,  # any_encrypted
+                False,  # use_cloud_storage
+                [RsyncCopyOperation, DecompressOperation],  # expected_operations
             ),
             (
-                True,
-                "remote",
-                False,
-                True,
-                True,
-                [DecryptOperation, RsyncCopyOperation, DecompressOperation],
+                True,  # is_remote_recovery
+                "remote",  # staging_location
+                False,  # is_incremental
+                True,  # any_compressed
+                True,  # any_encrypted
+                False,  # use_cloud_storage
+                [
+                    DecryptOperation,
+                    RsyncCopyOperation,
+                    DecompressOperation,
+                ],  # expected_operations
+            ),
+            (
+                False,  # is_remote_recovery
+                "local",  # staging_location
+                False,  # is_incremental
+                False,  # any_compressed
+                False,  # any_encrypted
+                True,  # use_cloud_storage
+                [DownloadOperation],  # expected_operations
+            ),
+            (
+                True,  # is_remote_recovery
+                "local",  # staging_location
+                False,  # is_incremental
+                False,  # any_compressed
+                False,  # any_encrypted
+                True,  # use_cloud_storage
+                [DownloadOperation, RsyncCopyOperation],  # expected_operations
+            ),
+            (
+                False,  # is_remote_recovery
+                "local",  # staging_location
+                True,  # is_incremental
+                False,  # any_compressed
+                False,  # any_encrypted
+                True,  # use_cloud_storage
+                [DownloadOperation, CombineOperation],  # expected_operations
+            ),
+            (
+                True,  # is_remote_recovery
+                "local",  # staging_location
+                True,  # is_incremental
+                False,  # any_compressed
+                False,  # any_encrypted
+                True,  # use_cloud_storage
+                [
+                    DownloadOperation,
+                    CombineOperation,
+                    RsyncCopyOperation,
+                ],  # expected_operations
+            ),
+            (
+                True,  # is_remote_recovery
+                "remote",  # staging_location
+                False,  # is_incremental
+                False,  # any_compressed
+                False,  # any_encrypted
+                True,  # use_cloud_storage
+                [DownloadOperation, RsyncCopyOperation],  # expected_operations
+            ),
+            (
+                True,  # is_remote_recovery
+                "remote",  # staging_location
+                True,  # is_incremental
+                False,  # any_compressed
+                False,  # any_encrypted
+                True,  # use_cloud_storage
+                [
+                    DownloadOperation,
+                    RsyncCopyOperation,
+                    CombineOperation,
+                ],  # expected_operations
             ),
         ],
     )
@@ -4878,6 +5909,7 @@ class TestMainRecoveryExecutor(object):
         is_incremental,
         any_compressed,
         any_encrypted,
+        use_cloud_storage,
         expected_operations,
     ):
         """
@@ -4888,6 +5920,7 @@ class TestMainRecoveryExecutor(object):
         mock_backup_manager = testing_helpers.build_backup_manager(
             main_conf={"staging_location": staging_location}
         )
+        mock_backup_manager.server.use_backup_cloud_storage = use_cloud_storage
 
         # AND a backup_info object (it has a parent if it is incremental)
         parent = None

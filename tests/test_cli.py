@@ -19,6 +19,7 @@
 import json
 import os
 import sys
+import tarfile
 from argparse import ArgumentTypeError
 
 import pytest
@@ -42,13 +43,16 @@ from barman.cli import (
     check_target_action,
     check_wal_archive,
     cloud_wal_archive,
+    cloud_wal_restore,
     command,
     config_switch,
+    export_backup,
     generate_manifest,
     get_model,
     get_models_list,
     get_server,
     get_server_list,
+    import_backup,
     keep,
     list_backups,
     list_files,
@@ -855,6 +859,128 @@ class TestCli(object):
         # AND there are no errors
         _out, err = capsys.readouterr()
         assert "" == err
+
+    @patch("barman.cli.parse_backup_id")
+    @patch("barman.cli.get_server")
+    def test_restore_no_get_wal_cloud_storage_fallback(
+        self,
+        get_server_mock,
+        parse_backup_id_mock,
+        mock_backup_info,
+        mock_restore_args,
+        capsys,
+    ):
+        """
+        Test that a warning is issued and get-wal is re-enabled when --no-get-wal
+        is used with a server that has WALs stored in cloud storage, even when
+        GET_WAL was already in recovery_options.
+        """
+        # GIVEN a backup
+        parse_backup_id_mock.return_value = mock_backup_info
+        mock_backup_info.is_incremental = False
+        mock_backup_info.encryption = None
+        # AND a server configured for cloud WAL storage
+        get_server_mock.return_value.use_backup_cloud_storage = False
+        get_server_mock.return_value.use_wal_cloud_storage = True
+        # AND recovery_options already contains GET_WAL
+        get_server_mock.return_value.config.recovery_options = {
+            barman.config.RecoveryOptions.GET_WAL
+        }
+        # AND --no-get-wal is passed
+        mock_restore_args.get_wal = False
+        # WHEN the restore command is run
+        with pytest.raises(SystemExit):
+            restore(mock_restore_args)
+        # THEN a warning is logged
+        _out, err = capsys.readouterr()
+        assert (
+            "get-wal is required for servers with WALs stored in cloud storage. "
+            "Automatically enabling --get-wal."
+        ) in err
+        # AND GET_WAL is re-added to recovery_options
+        assert (
+            barman.config.RecoveryOptions.GET_WAL
+            in get_server_mock.return_value.config.recovery_options
+        )
+
+    @patch("barman.cli.parse_backup_id")
+    @patch("barman.cli.get_server")
+    def test_restore_get_wal_enabled_when_no_get_wal_flag_with_cloud_storage(
+        self,
+        get_server_mock,
+        parse_backup_id_mock,
+        mock_backup_info,
+        mock_restore_args,
+        capsys,
+    ):
+        """
+        Test that a warning is issued and get-wal is automatically enabled when
+        --no-get-wal is used with a server that has WALs stored in cloud storage.
+        """
+        # GIVEN a backup
+        parse_backup_id_mock.return_value = mock_backup_info
+        mock_backup_info.is_incremental = False
+        mock_backup_info.encryption = None
+        # AND a server configured for cloud WAL storage
+        get_server_mock.return_value.use_backup_cloud_storage = False
+        get_server_mock.return_value.use_wal_cloud_storage = True
+        get_server_mock.return_value.config.recovery_options = set()
+        # AND --no-get-wal is passed
+        mock_restore_args.get_wal = False
+        # WHEN the restore command is run
+        with pytest.raises(SystemExit):
+            restore(mock_restore_args)
+        # THEN a warning is logged
+        _out, err = capsys.readouterr()
+        assert (
+            "get-wal is required for servers with WALs stored in cloud storage. "
+            "Automatically enabling --get-wal."
+        ) in err
+        # AND GET_WAL is added to recovery_options
+        assert (
+            barman.config.RecoveryOptions.GET_WAL
+            in get_server_mock.return_value.config.recovery_options
+        )
+
+    @patch("barman.cli.parse_backup_id")
+    @patch("barman.cli.get_server")
+    def test_restore_get_wal_enabled_when_not_in_recovery_options_with_cloud_storage(
+        self,
+        get_server_mock,
+        parse_backup_id_mock,
+        mock_backup_info,
+        mock_restore_args,
+        capsys,
+    ):
+        """
+        Test that a warning is issued and get-wal is automatically enabled when
+        recovery_options does not contain get-wal and server has WALs stored in
+        cloud storage.
+        """
+        # GIVEN a backup
+        parse_backup_id_mock.return_value = mock_backup_info
+        mock_backup_info.is_incremental = False
+        mock_backup_info.encryption = None
+        # AND a server configured for cloud WAL storage
+        get_server_mock.return_value.use_backup_cloud_storage = False
+        get_server_mock.return_value.use_wal_cloud_storage = True
+        get_server_mock.return_value.config.recovery_options = set()
+        # AND no get-wal flag is passed
+        del mock_restore_args.get_wal
+        # WHEN the restore command is run
+        with pytest.raises(SystemExit):
+            restore(mock_restore_args)
+        # THEN a warning is logged
+        _out, err = capsys.readouterr()
+        assert (
+            "get-wal is required for servers with WALs stored in cloud storage. "
+            "Automatically enabling --get-wal."
+        ) in err
+        # AND GET_WAL is added to recovery_options
+        assert (
+            barman.config.RecoveryOptions.GET_WAL
+            in get_server_mock.return_value.config.recovery_options
+        )
 
     @pytest.mark.parametrize(
         (
@@ -2799,7 +2925,9 @@ class TestCloudWalArchiveCli:
     @pytest.fixture
     def mock_args(self):
         return MagicMock(
-            server_name="SOME_SERVER", wal_path="/pg_wal/000000010000000000000001"
+            server_name="SOME_SERVER",
+            wal_path="/pg_wal/000000010000000000000001",
+            parallel=None,
         )
 
     @patch("barman.cli.output")
@@ -2867,15 +2995,744 @@ class TestCloudWalArchiveCli:
         """
         Test :func:`cloud_wal_archive`.
 
-        It should call cloud_wal_archive on the server with the provided WAL path if
-        all validations pass.
+        It should call cloud_wal_archive on the server with the WAL path and the
+        configured parallel value when all validations pass.
         """
+        mock_server = mock_get_server.return_value
+        mock_server.config.cloud_wal_archive_parallel = 0
+
         with patch("os.path.isdir", return_value=False), patch(
             "os.path.exists", return_value=True
         ), patch("barman.cli.is_any_xlog_file", return_value=True):
             with pytest.raises(SystemExit):
                 cloud_wal_archive(mock_args)
 
-        mock_get_server.return_value.cloud_wal_archive.assert_called_once_with(
-            "/pg_wal/000000010000000000000001"
+        mock_server.cloud_wal_archive.assert_called_once_with(
+            "/pg_wal/000000010000000000000001", 0
         )
+
+    @patch("barman.cli.get_server")
+    def test_cloud_wal_archive_cli_overrides_config(self, mock_get_server, mock_args):
+        """
+        Test :func:`cloud_wal_archive`.
+
+        The CLI flag --parallel should override the server config value.
+        """
+        mock_args.parallel = 4
+        mock_server = mock_get_server.return_value
+        mock_server.config.cloud_wal_archive_parallel = 0
+
+        with patch("os.path.isdir", return_value=False), patch(
+            "os.path.exists", return_value=True
+        ), patch("barman.cli.is_any_xlog_file", return_value=True):
+            with pytest.raises(SystemExit):
+                cloud_wal_archive(mock_args)
+
+        # THEN the config value should be overridden by the CLI flag
+        assert mock_server.config.cloud_wal_archive_parallel == 4
+        mock_server.cloud_wal_archive.assert_called_once_with(
+            "/pg_wal/000000010000000000000001", 4
+        )
+
+
+class TestCloudWalRestoreCli:
+    """Test ``barman cloud-wal-restore`` outcomes."""
+
+    @pytest.fixture
+    def mock_args(self):
+        return MagicMock(
+            server_name="test-server",
+            wal_name="0000000100000000000000A1",
+            wal_dest="/var/lib/pgsql/17/data/pg_wal/0000000100000000000000A1",
+            parallel=2,
+            spool_dir="/path/to/spool",
+        )
+
+    @patch("barman.cli.get_server")
+    def test_cloud_wal_restore_success(self, mock_get_server, mock_args):
+        """
+        Test :func:`cloud_wal_restore`.
+
+        It should call cloud_wal_restore on the server with the provided WAL path.
+        """
+        with pytest.raises(SystemExit):
+            cloud_wal_restore(mock_args)
+
+        mock_server = mock_get_server.return_value
+
+        assert mock_server.config.cloud_wal_restore_parallel == 2
+
+        mock_server.cloud_wal_restore.assert_called_once_with(
+            "0000000100000000000000A1",
+            "/var/lib/pgsql/17/data/pg_wal/0000000100000000000000A1",
+            "/path/to/spool",
+        )
+
+    @patch("barman.cli.output")
+    def test_cloud_wal_restore_wal_path_not_valid_wal_file(
+        self, mock_output, mock_args
+    ):
+        """
+        Test :func:`cloud_wal_restore`.
+
+        It should error out if the provided WAL name is not valid.
+        """
+        mock_output.close_and_exit.side_effect = SystemExit(1)
+
+        with patch("barman.cli.is_any_xlog_file", return_value=False):
+            with pytest.raises(SystemExit):
+                cloud_wal_restore(mock_args)
+
+        mock_output.error.assert_called_once_with(
+            "File is not a valid WAL file: 0000000100000000000000A1"
+        )
+        mock_output.close_and_exit.assert_called_once_with()
+
+
+class TestExportBackup(object):
+    """Test class for export_backup command."""
+
+    @patch("barman.cli.output.close_and_exit")
+    @patch("barman.cli.output.error")
+    @patch("barman.cli.parse_backup_id")
+    @patch("barman.cli.get_server")
+    def test_export_backup_invalid_backup_status(
+        self, mock_get_server, mock_parse_backup, mock_output_error, mock_close_and_exit
+    ):
+        """
+        Test that export_backup fails when backup status is not DONE.
+        """
+        # GIVEN a backup with non-DONE status
+        args = Mock()
+        args.server_name = "test_server"
+        args.backup_id = "20240101T120000"
+        args.output_directory = "/tmp/export"
+
+        mock_server = Mock()
+        mock_server.config.name = "test_server"
+        mock_get_server.return_value = mock_server
+
+        mock_backup_info = Mock()
+        mock_backup_info.status = BackupInfo.STARTED
+        mock_backup_info.is_incremental = False
+        mock_parse_backup.return_value = mock_backup_info
+
+        # Mock close_and_exit to actually exit
+        mock_close_and_exit.side_effect = SystemExit(1)
+
+        # WHEN export_backup is called
+        with pytest.raises(SystemExit):
+            export_backup(args)
+
+        # THEN error should be reported and command should exit
+        mock_output_error.assert_called_once_with(
+            "Cannot export backup '%s' from server '%s': backup status is '%s', expected 'DONE'",
+            args.backup_id,
+            mock_server.config.name,
+            BackupInfo.STARTED,
+        )
+        mock_close_and_exit.assert_called_once_with()
+
+    @patch("barman.cli.output.close_and_exit")
+    @patch("barman.cli.output.error")
+    @patch("barman.cli.parse_backup_id")
+    @patch("barman.cli.get_server")
+    def test_export_backup_incremental_refused(
+        self,
+        mock_get_server,
+        mock_parse_backup,
+        mock_output_error,
+        mock_close_and_exit,
+    ):
+        """
+        Test that export_backup refuses block-level incremental backups,
+        before any tarball output is produced.
+        """
+        # GIVEN a backup that is a PostgreSQL block-level incremental backup
+        args = Mock()
+        args.server_name = "test_server"
+        args.backup_id = "20240101T120000"
+        args.output_directory = "/tmp/export"
+
+        mock_server = Mock()
+        mock_server.config.name = "test_server"
+        mock_get_server.return_value = mock_server
+
+        mock_backup_info = Mock()
+        mock_backup_info.backup_id = args.backup_id
+        mock_backup_info.status = BackupInfo.DONE
+        mock_backup_info.is_incremental = True
+        mock_parse_backup.return_value = mock_backup_info
+
+        # AND close_and_exit actually exits
+        mock_close_and_exit.side_effect = SystemExit(1)
+
+        # WHEN export_backup is called
+        with pytest.raises(SystemExit):
+            export_backup(args)
+
+        # THEN an error naming the operation and the parent-chain reason
+        # is reported and the command exits
+        mock_output_error.assert_called_once_with(
+            "Cannot export backup %s from server %s: it is an incremental backup.\n"
+            "Only full backups are eligible for exporting."
+            % (args.backup_id, mock_server.config.name)
+        )
+        mock_close_and_exit.assert_called_once_with()
+        # AND the server-level export is never invoked
+        mock_server.export_backup.assert_not_called()
+
+    @patch("barman.cli.output.close_and_exit")
+    @patch("barman.cli.output.error")
+    @patch("barman.cli.os.path.exists", return_value=False)
+    @patch("barman.cli.parse_backup_id")
+    @patch("barman.cli.get_server")
+    def test_export_backup_output_directory_not_exists(
+        self,
+        mock_get_server,
+        mock_parse_backup,
+        mock_exists,
+        mock_output_error,
+        mock_close_and_exit,
+    ):
+        """
+        Test that export_backup fails when output directory doesn't exist.
+        """
+        # GIVEN a valid backup but non-existent output directory
+        args = Mock()
+        args.server_name = "test_server"
+        args.backup_id = "20240101T120000"
+        args.output_directory = "/nonexistent/path"
+
+        mock_server = Mock()
+        mock_server.config.name = "test_server"
+        mock_get_server.return_value = mock_server
+
+        mock_backup_info = Mock()
+        mock_backup_info.status = BackupInfo.DONE
+        mock_backup_info.is_incremental = False
+        mock_parse_backup.return_value = mock_backup_info
+
+        # Mock close_and_exit to actually exit
+        mock_close_and_exit.side_effect = SystemExit(1)
+
+        # WHEN export_backup is called
+        with pytest.raises(SystemExit):
+            export_backup(args)
+
+        # THEN error should be reported and command should exit
+        mock_output_error.assert_called_once_with(
+            "Output directory '%s' does not exist",
+            args.output_directory,
+        )
+        mock_close_and_exit.assert_called_once_with()
+
+    @patch("barman.cli.output.close_and_exit")
+    @patch("barman.cli.output.error")
+    @patch("barman.cli.os.path.isdir", return_value=False)
+    @patch("barman.cli.os.path.exists", return_value=True)
+    @patch("barman.cli.parse_backup_id")
+    @patch("barman.cli.get_server")
+    def test_export_backup_output_directory_not_directory(
+        self,
+        mock_get_server,
+        mock_parse_backup,
+        mock_exists,
+        mock_isdir,
+        mock_output_error,
+        mock_close_and_exit,
+    ):
+        """
+        Test that export_backup fails when output directory is not a directory.
+        """
+        # GIVEN a valid backup but output directory that exists but is not a directory
+        args = Mock()
+        args.server_name = "test_server"
+        args.backup_id = "20240101T120000"
+        args.output_directory = "/path/to/file.txt"
+
+        mock_server = Mock()
+        mock_server.config.name = "test_server"
+        mock_get_server.return_value = mock_server
+
+        mock_backup_info = Mock()
+        mock_backup_info.status = BackupInfo.DONE
+        mock_backup_info.is_incremental = False
+        mock_parse_backup.return_value = mock_backup_info
+
+        # Mock close_and_exit to actually exit
+        mock_close_and_exit.side_effect = SystemExit(1)
+
+        # WHEN export_backup is called
+        with pytest.raises(SystemExit):
+            export_backup(args)
+
+        # THEN error should be reported and command should exit
+        mock_output_error.assert_called_once_with(
+            "Output directory '%s' is not a directory",
+            args.output_directory,
+        )
+        mock_close_and_exit.assert_called_once_with()
+
+    @patch("barman.cli.output.close_and_exit")
+    @patch("barman.cli.output.error")
+    @patch("barman.cli.os.access", return_value=False)
+    @patch("barman.cli.os.path.isdir", return_value=True)
+    @patch("barman.cli.os.path.exists", return_value=True)
+    @patch("barman.cli.parse_backup_id")
+    @patch("barman.cli.get_server")
+    def test_export_backup_output_directory_not_writable(
+        self,
+        mock_get_server,
+        mock_parse_backup,
+        mock_exists,
+        mock_isdir,
+        mock_access,
+        mock_output_error,
+        mock_close_and_exit,
+    ):
+        """
+        Test that export_backup fails when output directory doesn't have write/execute
+        permissions.
+        """
+        # GIVEN a valid backup but output directory without write/execute permissions
+        args = Mock()
+        args.server_name = "test_server"
+        args.backup_id = "20240101T120000"
+        args.output_directory = "/readonly/path"
+
+        mock_server = Mock()
+        mock_server.config.name = "test_server"
+        mock_get_server.return_value = mock_server
+
+        mock_backup_info = Mock()
+        mock_backup_info.status = BackupInfo.DONE
+        mock_backup_info.is_incremental = False
+        mock_parse_backup.return_value = mock_backup_info
+
+        # Mock close_and_exit to actually exit
+        mock_close_and_exit.side_effect = SystemExit(1)
+
+        # WHEN export_backup is called
+        with pytest.raises(SystemExit):
+            export_backup(args)
+
+        # THEN error should be reported and command should exit
+        mock_output_error.assert_called_once_with(
+            "Output directory '%s' does not have the required write and execute permissions",
+            args.output_directory,
+        )
+        mock_close_and_exit.assert_called_once_with()
+
+    @patch("barman.cli.output.close_and_exit")
+    @patch("barman.cli.os.access", return_value=True)
+    @patch("barman.cli.os.path.isdir", return_value=True)
+    @patch("barman.cli.os.path.exists", return_value=True)
+    @patch("barman.cli.parse_backup_id")
+    @patch("barman.cli.get_server")
+    def test_export_backup_success(
+        self,
+        mock_get_server,
+        mock_parse_backup,
+        mock_exists,
+        mock_isdir,
+        mock_access,
+        mock_close_and_exit,
+    ):
+        """
+        Test that export_backup delegates to server.export_backup when all
+        validations pass.
+        """
+        # GIVEN a valid backup with DONE status
+        args = Mock()
+        args.server_name = "test_server"
+        args.backup_id = "20240101T120000"
+        args.output_directory = "/tmp/export"
+        args.compression = None
+        args.compression_level = None
+
+        mock_server = Mock()
+        mock_server.config.name = "test_server"
+        mock_get_server.return_value = mock_server
+
+        mock_backup_info = Mock()
+        mock_backup_info.status = BackupInfo.DONE
+        mock_backup_info.is_incremental = False
+        mock_parse_backup.return_value = mock_backup_info
+
+        # WHEN export_backup is called
+        export_backup(args)
+
+        # THEN server.export_backup is called with the correct arguments
+        mock_server.export_backup.assert_called_once_with(
+            mock_backup_info,
+            args.output_directory,
+            compression=None,
+            compression_level=None,
+        )
+        # AND close_and_exit is called
+        mock_close_and_exit.assert_called_once_with()
+
+    @patch("barman.cli.output.close_and_exit")
+    @patch("barman.cli.os.access", return_value=True)
+    @patch("barman.cli.os.path.isdir", return_value=True)
+    @patch("barman.cli.os.path.exists", return_value=True)
+    @patch("barman.cli.parse_backup_id")
+    @patch("barman.cli.get_server")
+    def test_export_backup_compression_forwarded(
+        self,
+        mock_get_server,
+        mock_parse_backup,
+        mock_exists,
+        mock_isdir,
+        mock_access,
+        mock_close_and_exit,
+    ):
+        """
+        Test that --compression and --compression-level are forwarded to
+        server.export_backup.
+        """
+        # GIVEN a valid backup with gzip compression and level 6
+        args = Mock()
+        args.server_name = "test_server"
+        args.backup_id = "20240101T120000"
+        args.output_directory = "/tmp/export"
+        args.compression = "gzip"
+        args.compression_level = 6
+
+        mock_server = Mock()
+        mock_server.config.name = "test_server"
+        mock_get_server.return_value = mock_server
+
+        mock_backup_info = Mock()
+        mock_backup_info.status = BackupInfo.DONE
+        mock_parse_backup.return_value = mock_backup_info
+
+        # WHEN export_backup is called
+        export_backup(args)
+
+        # THEN server.export_backup is called with the compression arguments
+        mock_server.export_backup.assert_called_once_with(
+            mock_backup_info,
+            args.output_directory,
+            compression="gzip",
+            compression_level=6,
+        )
+
+    @patch("barman.cli.output.close_and_exit")
+    @patch("barman.cli.output.error")
+    @patch("barman.cli.os.access", return_value=True)
+    @patch("barman.cli.os.path.isdir", return_value=True)
+    @patch("barman.cli.os.path.exists", return_value=True)
+    @patch("barman.cli.parse_backup_id")
+    @patch("barman.cli.get_server")
+    def test_export_backup_compression_level_without_compression_errors(
+        self,
+        mock_get_server,
+        mock_parse_backup,
+        mock_exists,
+        mock_isdir,
+        mock_access,
+        mock_output_error,
+        mock_close_and_exit,
+    ):
+        """
+        Test that --compression-level without --compression produces an error.
+        """
+        # GIVEN a valid backup but compression level set without compression
+        args = Mock()
+        args.server_name = "test_server"
+        args.backup_id = "20240101T120000"
+        args.output_directory = "/tmp/export"
+        args.compression = None
+        args.compression_level = 5
+
+        mock_server = Mock()
+        mock_server.config.name = "test_server"
+        mock_get_server.return_value = mock_server
+
+        mock_backup_info = Mock()
+        mock_backup_info.status = BackupInfo.DONE
+        mock_backup_info.is_incremental = False
+        mock_parse_backup.return_value = mock_backup_info
+
+        # Mock close_and_exit to actually exit
+        mock_close_and_exit.side_effect = SystemExit(1)
+
+        # WHEN export_backup is called
+        with pytest.raises(SystemExit):
+            export_backup(args)
+
+        # THEN an error is reported
+        mock_output_error.assert_called_once_with(
+            "--compression-level requires --compression to be set"
+        )
+
+    @patch("barman.cli.output.close_and_exit")
+    @patch("barman.cli.output.error")
+    @patch("barman.cli.os.access", return_value=True)
+    @patch("barman.cli.os.path.isdir", return_value=True)
+    @patch("barman.cli.os.path.exists", return_value=True)
+    @patch("barman.cli.parse_backup_id")
+    @patch("barman.cli.get_server")
+    @pytest.mark.parametrize(
+        "compression,compression_level,expected_valid_levels",
+        [
+            # gzip and bzip2 share the same valid range (1-9): reject negatives,
+            # zero, and out-of-range values
+            ("gzip", -1, "1, 2, 3, 4, 5, 6, 7, 8, 9"),
+            ("gzip", 0, "1, 2, 3, 4, 5, 6, 7, 8, 9"),
+            ("gzip", 10, "1, 2, 3, 4, 5, 6, 7, 8, 9"),
+            ("bzip2", 0, "1, 2, 3, 4, 5, 6, 7, 8, 9"),
+            ("bzip2", 10, "1, 2, 3, 4, 5, 6, 7, 8, 9"),
+            # xz allows 0 but otherwise has the same range
+            ("xz", -1, "0, 1, 2, 3, 4, 5, 6, 7, 8, 9"),
+            ("xz", 10, "0, 1, 2, 3, 4, 5, 6, 7, 8, 9"),
+        ],
+    )
+    def test_export_backup_invalid_compression_level_errors(
+        self,
+        mock_get_server,
+        mock_parse_backup,
+        mock_exists,
+        mock_isdir,
+        mock_access,
+        mock_output_error,
+        mock_close_and_exit,
+        compression,
+        compression_level,
+        expected_valid_levels,
+    ):
+        """
+        Test that a --compression-level outside the valid range for the chosen
+        algorithm produces an error.
+        """
+        # GIVEN a valid backup but an out-of-range compression level for the
+        # chosen algorithm
+        args = Mock()
+        args.server_name = "test_server"
+        args.backup_id = "20240101T120000"
+        args.output_directory = "/tmp/export"
+        args.compression = compression
+        args.compression_level = compression_level
+
+        mock_server = Mock()
+        mock_server.config.name = "test_server"
+        mock_get_server.return_value = mock_server
+
+        mock_backup_info = Mock()
+        mock_backup_info.status = BackupInfo.DONE
+        mock_backup_info.is_incremental = False
+        mock_parse_backup.return_value = mock_backup_info
+
+        # Mock close_and_exit to actually exit
+        mock_close_and_exit.side_effect = SystemExit(1)
+
+        # WHEN export_backup is called
+        with pytest.raises(SystemExit):
+            export_backup(args)
+
+        # THEN an error is reported, naming the invalid level, the algorithm,
+        # and the valid range
+        mock_output_error.assert_called_once_with(
+            "Invalid compression level '%s' for algorithm '%s'. "
+            "Valid levels are: %s",
+            compression_level,
+            compression,
+            expected_valid_levels,
+        )
+
+
+class TestImportBackup(object):
+    """Test class for import_backup command."""
+
+    @pytest.fixture
+    def args(self):
+        """Build a mock argparse Namespace for import_backup tests."""
+        args = Mock()
+        args.server_name = "test_server"
+        return args
+
+    @pytest.fixture
+    def mock_server(self):
+        """Build a mock server for import_backup tests."""
+        mock_server = Mock()
+        mock_server.config.name = "test_server"
+        return mock_server
+
+    @patch("barman.cli.output.close_and_exit")
+    @patch("barman.cli.output.error")
+    @patch("barman.cli.get_server")
+    def test_import_backup_tarball_unexisting(
+        self,
+        mock_get_server,
+        mock_output_error,
+        mock_close_and_exit,
+        args,
+        mock_server,
+        tmpdir,
+    ):
+        """
+        Test that import_backup fails when tarball file doesn't exist.
+        """
+        # GIVEN a valid server and a path to a file that doesn't exist
+        mock_get_server.return_value = mock_server
+        args.input_tarball = tmpdir.join("nonexistent.tar").strpath
+        mock_close_and_exit.side_effect = SystemExit(1)
+
+        # WHEN import_backup is called
+        # THEN the command exits with an error about the missing file
+        with pytest.raises(SystemExit):
+            import_backup(args)
+
+        mock_output_error.assert_called_once_with(
+            "Tarball file '%s' does not exist",
+            args.input_tarball,
+        )
+        mock_close_and_exit.assert_called_once_with()
+
+    @patch("barman.cli.output.close_and_exit")
+    @patch("barman.cli.output.error")
+    @patch("barman.cli.get_server")
+    def test_import_backup_tarball_not_a_file(
+        self,
+        mock_get_server,
+        mock_output_error,
+        mock_close_and_exit,
+        args,
+        mock_server,
+        tmpdir,
+    ):
+        """
+        Test that import_backup fails when tarball path is not a file.
+        """
+        # GIVEN a path that points to a directory instead of a file
+        mock_get_server.return_value = mock_server
+        args.input_tarball = tmpdir.mkdir("some_directory").strpath
+        mock_close_and_exit.side_effect = SystemExit(1)
+
+        # WHEN import_backup is called
+        # THEN the command exits with an error about the path not being a file
+        with pytest.raises(SystemExit):
+            import_backup(args)
+
+        mock_output_error.assert_called_once_with(
+            "Tarball path '%s' is not a file",
+            args.input_tarball,
+        )
+        mock_close_and_exit.assert_called_once_with()
+
+    @patch("barman.cli.output.close_and_exit")
+    @patch("barman.cli.output.error")
+    @patch("barman.cli.os.access", return_value=False)
+    @patch("barman.cli.get_server")
+    def test_import_backup_tarball_not_readable(
+        self,
+        mock_get_server,
+        mock_access,
+        mock_output_error,
+        mock_close_and_exit,
+        args,
+        mock_server,
+        tmpdir,
+    ):
+        """
+        Test that import_backup fails when tarball file is not readable.
+        """
+        # GIVEN a real file that is reported as not readable by os.access
+        mock_get_server.return_value = mock_server
+        tar_path = tmpdir.join("unreadable.tar")
+        tar_path.write_binary(b"")
+        args.input_tarball = tar_path.strpath
+        mock_close_and_exit.side_effect = SystemExit(1)
+
+        # WHEN import_backup is called
+        # THEN the command exits with an error about readability
+        with pytest.raises(SystemExit):
+            import_backup(args)
+
+        mock_output_error.assert_called_once_with(
+            "Tarball file '%s' is not readable",
+            args.input_tarball,
+        )
+        mock_close_and_exit.assert_called_once_with()
+
+    @patch("barman.cli.output.close_and_exit")
+    @patch("barman.cli.output.error")
+    @patch("barman.cli.get_server")
+    def test_import_backup_invalid_tarfile(
+        self,
+        mock_get_server,
+        mock_output_error,
+        mock_close_and_exit,
+        args,
+        mock_server,
+        tmpdir,
+    ):
+        """
+        Test that import_backup fails when file is not a valid tar file.
+        """
+        # GIVEN a real file that is not a valid tarball
+        mock_get_server.return_value = mock_server
+        tar_path = tmpdir.join("invalid.txt")
+        tar_path.write("not a tar file")
+        args.input_tarball = tar_path.strpath
+        mock_close_and_exit.side_effect = SystemExit(1)
+
+        # WHEN import_backup is called
+        # THEN the command exits with an error about the tar file being invalid
+        with pytest.raises(SystemExit):
+            import_backup(args)
+
+        mock_output_error.assert_called_once_with(
+            "File '%s' is not a valid tar file",
+            args.input_tarball,
+        )
+        mock_close_and_exit.assert_called_once_with()
+
+    @pytest.mark.parametrize(
+        "filename, mode",
+        [
+            ("backup.tar", "w"),
+            ("backup.tar.gz", "w:gz"),
+            ("backup.tar.bz2", "w:bz2"),
+            ("backup.tar.xz", "w:xz"),
+        ],
+    )
+    @patch("barman.cli.output.close_and_exit")
+    @patch("barman.cli.output.info")
+    @patch("barman.cli.get_server")
+    def test_import_backup_success(
+        self,
+        mock_get_server,
+        mock_output_info,
+        mock_close_and_exit,
+        filename,
+        mode,
+        args,
+        mock_server,
+        tmpdir,
+    ):
+        """
+        Test that import_backup logs info message and exits when all
+        validations pass, for each supported tarball format (including the
+        compressed variants produced by ``export-backup``).
+        """
+        # GIVEN a valid (empty) tarball file using the given compression
+        mock_get_server.return_value = mock_server
+        tar_path = tmpdir.join(filename).strpath
+        with tarfile.open(tar_path, mode):
+            pass
+        args.input_tarball = tar_path
+
+        # WHEN import_backup is called
+        import_backup(args)
+
+        # THEN an info message is logged with tarball path and server name
+        mock_output_info.assert_called_once_with(
+            "Importing backup from '%s' to server '%s'",
+            args.input_tarball,
+            mock_server.config.name,
+        )
+        # AND close_and_exit is called
+        mock_close_and_exit.assert_called_once_with()

@@ -53,6 +53,7 @@ from barman.compression import (
     compression_registry,
 )
 from barman.copy_controller import RsyncCopyController
+from barman.diagnose import get_barman_system_info
 from barman.encryption import get_passphrase_from_command
 from barman.exceptions import (
     ArchiverFailure,
@@ -121,8 +122,8 @@ from barman.wal_archiver import (
     StreamingWalArchiver,
     WalArchiver,
 )
+from barman.xlog import PARTIAL_EXTENSION
 
-PARTIAL_EXTENSION = ".partial"
 PRIMARY_INFO_FILE = "primary.info"
 SYNC_WALS_INFO_FILE = "sync-wals.info"
 
@@ -287,7 +288,7 @@ class Server(RemoteStatusMixin):
         self.archivers = []
 
         # Postgres configuration is available only if node is not passive
-        if not self.passive_node:
+        if self.config.active and not self.passive_node:
             self._init_postgres(config)
 
         # Initialize the backup manager
@@ -295,7 +296,7 @@ class Server(RemoteStatusMixin):
 
         self._init_wal_storage()
 
-        if not self.passive_node:
+        if self.config.active and not self.passive_node:
             self._init_archivers()
 
         # Set global and tablespace bandwidth limits
@@ -691,7 +692,7 @@ class Server(RemoteStatusMixin):
                 # Check WAL archive
                 self.check_archive(check_strategy)
                 # Postgres configuration is not available on passive nodes
-                if not self.passive_node:
+                if self.config.active and not self.passive_node:
                     self.check_postgres(check_strategy)
                     self.check_wal_streaming(check_strategy)
                 # Check barman directories from barman configuration
@@ -716,8 +717,9 @@ class Server(RemoteStatusMixin):
                 self.check_identity(check_strategy)
                 # Executes check() for every archiver, passing
                 # remote status information for efficiency
-                for archiver in self.archivers:
-                    archiver.check(check_strategy)
+                if self.config.active:
+                    for archiver in self.archivers:
+                        archiver.check(check_strategy)
 
                 # Check archiver errors
                 self.check_archiver_errors(check_strategy)
@@ -1301,15 +1303,23 @@ class Server(RemoteStatusMixin):
 
     def _make_directories(self):
         """
-        Make backup directories in case they do not exist
+        Make server's directories in case they do not exist
         """
+        dirs = []
         for key in self.config.KEYS:
             if key.endswith("_directory") and hasattr(self.config, key):
                 val = getattr(self.config, key)
                 # Create the directory only if it does not exist and is not a URL
                 if val is not None and not os.path.isdir(val) and "://" not in val:
-                    # noinspection PyTypeChecker
-                    os.makedirs(val)
+                    dirs.append(val)
+
+        # The meta directory is a server-level property, not a config key,
+        # so it must be added explicitly.
+        if not os.path.isdir(self.meta_directory):
+            dirs.append(self.meta_directory)
+
+        for directory in dirs:
+            os.makedirs(directory, exist_ok=True)
 
     def check_directories(self, check_strategy):
         """
@@ -1733,8 +1743,8 @@ class Server(RemoteStatusMixin):
             active_model,
         )
 
-        # Postgres status is available only if node is not passive
-        if not self.passive_node:
+        # Postgres status is available only if node is active and is not passive
+        if self.config.active and not self.passive_node:
             self.status_postgres()
             self.status_wal_archiver()
 
@@ -1945,6 +1955,287 @@ class Server(RemoteStatusMixin):
             # warn the user and terminate
             output.error("Permission denied, unable to access '%s'" % e)
             return False
+
+    def export_backup(
+        self, backup_info, output_directory, compression=None, compression_level=None
+    ):
+        """
+        Export a backup to a portable tarball format.
+
+        This method handles orchestration of the export process:
+        - Generates temporary and final filenames
+        - Collects server-level metadata (identity data, system info)
+        - Delegates core tarball creation to backup_manager
+        - Handles checksum calculation and file renaming
+        - Cleans up on failure
+
+        :param BackupInfo backup_info: the backup to export
+        :param str output_directory: directory where the export file will be created
+        :param str|None compression: compression algorithm (``gzip``, ``bzip2``,
+            ``xz``) or ``None`` for no compression
+        :param int|None compression_level: compression level to pass to the
+            compressor, or ``None`` for the default level
+        """
+        # Cloud storage is not yet supported for backup export
+        if self.use_backup_cloud_storage or self.use_wal_cloud_storage:
+            output.error("Backup export is not supported for cloud storage")
+            return
+
+        # Verify identity file exists - required for import validation
+        identity_data = self.read_identity_file()
+        if not identity_data:
+            output.error(
+                "No identity file found for server '%s'. "
+                "The identity file is required to validate the backup during import."
+                % self.config.name
+            )
+            return
+
+        # Generate export filename format:
+        # backup-export-{SERVER_NAME}-{BACKUP_ID}-{ISO_DATE}-{CHECKSUM}.tar
+        iso_date = datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y%m%dT%H%M%S"
+        )
+
+        # Create temporary filename without checksum first
+        temp_filename = "backup-export-%s-%s-%s.tmp" % (
+            self.config.name,
+            backup_info.backup_id,
+            iso_date,
+        )
+        temp_filepath = os.path.join(output_directory, temp_filename)
+
+        try:
+            # Collect system information for barman.json
+            barman_data = get_barman_system_info()
+
+            # Acquire a lock on the source backup to prevent concurrent
+            # deletion or modification during export
+            with ServerBackupIdLock(
+                self.config.barman_lock_directory,
+                self.config.name,
+                backup_info.backup_id,
+            ):
+                # Delegate core export work to backup_manager
+                self.backup_manager.export_backup(
+                    backup_info,
+                    temp_filepath,
+                    identity_data,
+                    barman_data,
+                    compression=compression,
+                    compression_level=compression_level,
+                )
+
+            # Calculate checksum of the completed tarball
+            output.debug("Calculating checksum for integrity verification")
+            checksum = file_hash(temp_filepath)[:8]
+
+            # Create final filename with checksum and correct extension
+            file_extensions = {"gzip": ".tar.gz", "bzip2": ".tar.bz2", "xz": ".tar.xz"}
+            file_ext = file_extensions.get(compression, ".tar")
+            export_filename = "backup-export-%s-%s-%s-%s%s" % (
+                self.config.name,
+                backup_info.backup_id,
+                iso_date,
+                checksum,
+                file_ext,
+            )
+            export_filepath = os.path.join(output_directory, export_filename)
+
+            # Rename to final filename
+            os.rename(temp_filepath, export_filepath)
+
+            output.info("Export completed successfully: %s" % export_filepath)
+
+        except LockFileBusy:
+            output.error(
+                "Another backup operation is already running on backup '%s' "
+                "for server '%s'" % (backup_info.backup_id, self.config.name)
+            )
+            return
+        except LockFilePermissionDenied:
+            output.error(
+                "Permission denied while acquiring backup export lock for backup "
+                "'%s' on server '%s'" % (backup_info.backup_id, self.config.name)
+            )
+            return
+        except LockFileException as e:
+            output.error(
+                "Unable to acquire backup export lock for backup '%s' on server "
+                "'%s': %s" % (backup_info.backup_id, self.config.name, force_str(e))
+            )
+            return
+        except Exception:
+            # Clean up temporary file if it exists
+            if os.path.exists(temp_filepath):
+                try:
+                    os.remove(temp_filepath)
+                except OSError as cleanup_error:
+                    output.warning(
+                        "Failed to clean up temporary file '%s': %s",
+                        temp_filepath,
+                        cleanup_error,
+                    )
+            raise
+
+    def import_backup(self, input_tarball):
+        """
+        Import a backup from an exported tarball into the Barman catalog.
+
+        This method handles orchestration of the import process:
+        - Validates cloud storage is not configured
+        - Reads local identity data for validation
+        - Ensures backup directories exist
+        - Delegates core import work to backup_manager
+
+        :param str input_tarball: path to the exported backup tarball
+        """
+        # Cloud storage is not yet supported for backup import
+        if self.use_backup_cloud_storage or self.use_wal_cloud_storage:
+            output.error("Backup import is not supported for cloud storage")
+            return
+
+        # Verify identity file exists - required for identity validation
+        local_identity = self.read_identity_file()
+        if not local_identity:
+            output.error(
+                "No identity file found for server '%s'. "
+                "The identity file is required to validate the backup during import."
+                % self.config.name
+            )
+            return
+
+        # Ensure backup directories exist
+        try:
+            self._make_directories()
+        except OSError as e:
+            output.error(
+                "Failed to create backup directory '%s': %s" % (e.filename, e.strerror)
+            )
+            return
+
+        # Validate tarball filename and checksum integrity. The checksum
+        # check reads the tarball end-to-end. The backup manager will then
+        # open the tarball again to extract it. This is intentional: we
+        # want to detect corruption BEFORE writing anything to the catalog,
+        # which means we cannot fold the hash computation into the
+        # extraction stream.
+        backup_id = self._validate_import_tarball_name(input_tarball)
+        if not backup_id:
+            return
+
+        # Serialize catalog mutations with other backup operations.
+        try:
+            with ServerBackupLock(self.config.barman_lock_directory, self.config.name):
+                with ServerBackupIdLock(
+                    self.config.barman_lock_directory, self.config.name, backup_id
+                ):
+                    # Delegate core import work to backup_manager
+                    self.backup_manager.import_backup(
+                        input_tarball, local_identity, backup_id
+                    )
+        except LockFileBusy:
+            output.error(
+                "Another backup operation is already running on server '%s'"
+                % self.config.name
+            )
+            return
+        except LockFilePermissionDenied:
+            output.error(
+                "Permission denied while acquiring backup import lock for server "
+                "'%s'" % self.config.name
+            )
+            return
+        except LockFileException as e:
+            output.error(
+                "Unable to acquire backup import lock for server '%s': %s"
+                % (self.config.name, force_str(e))
+            )
+            return
+
+    def _validate_import_tarball_name(self, input_tarball):
+        """
+        Validate that the tarball filename matches the expected export format
+        and that the embedded checksum matches the file's actual checksum.
+
+        Expected format::
+
+            backup-export-{SERVER_NAME}-{BACKUP_ID}-{TIMESTAMP}-{CHECKSUM}.tar[.gz|.bz2|.xz]
+
+        Where BACKUP_ID and TIMESTAMP are ``YYYYMMDDTHHMMSS`` and CHECKSUM is
+        8 lowercase hex characters.
+
+        :param str input_tarball: path to the tarball
+        :return: the backup_id extracted from the filename, or None on failure
+        :rtype: str|None
+        """
+        filename = os.path.basename(input_tarball)
+
+        base_error = (
+            "Tarball filename does not match the expected export format "
+            "'backup-export-SERVER_NAME-BACKUP_ID-TIMESTAMP-CHECKSUM.tar': '%s'"
+            % filename
+        )
+
+        # Match against accepted extensions, longest first so that ``.tar``
+        # does not pre-match ``.tar.gz`` and friends.
+        accepted_extensions = (".tar.gz", ".tar.bz2", ".tar.xz", ".tar")
+        matched_extension = next(
+            (ext for ext in accepted_extensions if filename.endswith(ext)),
+            None,
+        )
+        if matched_extension is None:
+            output.error(
+                f"{base_error}. Expected a .tar, .tar.gz, .tar.bz2, "
+                "or .tar.xz file extension."
+            )
+            return None
+
+        # Strip the matched extension to get the descriptive part of the name
+        filename = filename[: -len(matched_extension)]
+
+        prefix = "backup-export-%s-" % self.config.name
+
+        if not filename.startswith(prefix):
+            output.error(f"{base_error}. Expected filename to start with '{prefix}'.")
+            return None
+
+        # Strip prefix, leaving BACKUP_ID-TIMESTAMP-CHECKSUM
+        remainder = filename[len(prefix) :]
+        parts = remainder.split("-")
+
+        if len(parts) != 3:
+            output.error(
+                f"{base_error}. Expected filename to contain the backup ID, timestamp, "
+                "and checksum after the server name."
+            )
+            return None
+
+        backup_id, timestamp, expected_checksum = parts
+
+        # Validate BACKUP_ID and TIMESTAMP format
+        for label, value in [("BACKUP_ID", backup_id), ("TIMESTAMP", timestamp)]:
+            try:
+                datetime.datetime.strptime(value, "%Y%m%dT%H%M%S")
+            except ValueError:
+                output.error(
+                    f"{base_error}. Expected {label} to be in the format "
+                    f"'YYYYMMDDTHHMMSS', got '{value}'."
+                )
+                return None
+
+        # Verify the checksum matches the file contents
+        output.debug("Verifying tarball checksum")
+        actual_checksum = file_hash(input_tarball)[:8]
+        if actual_checksum != expected_checksum:
+            output.error(
+                "Tarball checksum mismatch: filename contains '%s' "
+                "but actual checksum is '%s'. The file may have been "
+                "modified or corrupted." % (expected_checksum, actual_checksum)
+            )
+            return None
+
+        return backup_id
 
     def backup(self, wait=False, wait_timeout=None, backup_name=None, **kwargs):
         """
@@ -2229,6 +2520,7 @@ class Server(RemoteStatusMixin):
         target_xid=None,
         target_lsn=None,
         target_immediate=False,
+        include_partial=False,
     ):
         """
         Get the xlog files required for a recovery.
@@ -2244,6 +2536,32 @@ class Server(RemoteStatusMixin):
             easier to handle, so we only copy the WALs required to reach the requested
             targets.
 
+        .. note::
+            ``.partial`` WAL files may appear in two places:
+
+            1. The main WAL archive (``wals/``): archived with the ``.partial`` suffix
+               when a standby is promoted and PostgreSQL calls ``archive_command`` with
+               the in-progress segment.  These entries appear in ``xlog.db`` and are
+               yielded as part of the normal iteration when *include_partial* is
+               ``True``.
+
+            2. The streaming WALs directory (``streaming/``): written by
+               ``pg_receivewal`` while actively receiving a segment.  When
+               *include_partial* is ``True``, this method also checks that directory for
+               the ``.partial`` file of the WAL segment immediately following the last
+               archived WAL.  The following rules apply to this additional check:
+
+               - The check is skipped when *target_immediate* is ``True``, since
+                 recovery stops at the first consistent state.
+               - The expected segment must be on the *calculated_target_tli* timeline;
+                 if *end* is on a different timeline (e.g. right after a failover with
+                 no archived WALs on the new timeline yet), the check is skipped.
+               - For *target_lsn*: the expected segment must be ``<=`` the WAL
+                 segment containing the target LSN; otherwise it is skipped.
+
+            When *include_partial* is ``False`` (the default), ``.partial`` files
+            from both sources are skipped entirely.
+
         :param BackupInfo backup: a backup object
         :param target_tli: target timeline, either a timeline ID or one of the keywords
             supported by Postgres
@@ -2252,19 +2570,34 @@ class Server(RemoteStatusMixin):
         :param target_lsn: target LSN
         :param target_immediate: target that ends recovery as soon as consistency is
             reached. Defaults to ``False``.
+        :param bool include_partial: when ``True``, yield ``.partial`` WAL files
+            from both the main WAL archive and the streaming WALs directory.
+            When ``False`` (the default), ``.partial`` files are skipped
+            entirely.
         """
         begin = backup.begin_wal
         end = backup.end_wal
+        is_pitr = any(
+            [target_tli, target_time, target_xid, target_lsn, target_immediate]
+        )
 
         # Calculate the integer value of TLI if a keyword is provided
         calculated_target_tli = parse_target_tli(
             self.backup_manager, target_tli, backup
         )
 
-        # If timeline isn't specified, assume it is the same timeline
-        # of the backup
+        # If timeline isn't specified, the default depends on the Postgres version
+        # and on whether this is a PITR or not
         if not target_tli:
-            target_tli, _, _ = xlog.decode_segment_name(end)
+            # If this is a PITR and version is newer than 12, then the default timeline
+            # is the latest one. This mimics the behavior of Postgres >= 12 (which has
+            # recovery_target_timeline = 'latest' as default)
+            if is_pitr and self.postgres.server_version >= 120000:
+                target_tli = self._get_latest_timeline()
+            # For older versions or when not doing PITR, the default timeline is that
+            # of the current backup (i.e. the timeline of the end WAL segment)
+            else:
+                target_tli, _, _ = xlog.decode_segment_name(end)
             calculated_target_tli = target_tli
 
         # If a target LSN was specified, get the name of the last WAL file that is
@@ -2295,12 +2628,70 @@ class Server(RemoteStatusMixin):
                     if target_lsn and wal_info.name > target_wal:
                         break
                     end = wal_info.name
+                # .partial files from the archive are only useful when the
+                # caller explicitly opts in via include_partial.  Skipping
+                # them here avoids yielding WAL entries that _xlog_copy
+                # would silently discard anyway.
+                if not include_partial and xlog.is_partial_file(wal_info.name):
+                    continue
                 yield wal_info
             # return all the remaining history files
             for line in fxlogdb:
                 wal_info = WalFileInfo.from_xlogdb_line(line)
                 if xlog.is_history_file(wal_info.name):
                     yield wal_info
+
+        # Finally, check the `streaming` directory to see if the next expected
+        # WAL segment is being received as a .partial file. We skip this entirely
+        # for --target-immediate since in that case we only need WALs up to the
+        # first consistent point.
+        #
+        # pg_receivewal guarantees at most one .partial file exists at any time,
+        # so we compute the name of the segment that *follows* the last WAL we
+        # yielded (``end``) and check whether that exact .partial file is present.
+        # This approach is precise: it ensures no gap between the last archived
+        # WAL and the partial file, and it avoids any ambiguity when stale
+        # .partial files from a previous pg_receivewal run are still present.
+        #
+        # For --target-lsn we additionally skip the partial file if its segment
+        # is beyond the target WAL, since recovery does not need WALs past the
+        # target LSN segment.
+        if include_partial and not target_immediate:
+            next_expected = xlog.next_segment_name(end, backup.xlog_segment_size)
+            tli_next, _, _ = xlog.decode_segment_name(next_expected)
+            if tli_next == calculated_target_tli and (
+                not target_lsn or next_expected <= target_wal
+            ):
+                partial_path = os.path.join(
+                    self.config.streaming_wals_directory,
+                    next_expected + PARTIAL_EXTENSION,
+                )
+                if os.path.exists(partial_path):
+                    output.debug(
+                        "Found .partial WAL file for server %s: %s",
+                        self.config.name,
+                        partial_path,
+                    )
+                    yield WalFileInfo.from_file(
+                        partial_path, compression=None, encryption=None
+                    )
+                else:
+                    output.debug(
+                        "No .partial WAL file found for server %s at expected path: %s",
+                        self.config.name,
+                        partial_path,
+                    )
+
+    def _get_latest_timeline(self):
+        """
+        Get the latest timeline available in the archived WALs.
+
+        :return int: the latest timeline ID, or ``1`` if no archived WALs are found
+        """
+        latest_timeline = max(
+            self.backup_manager.get_latest_archived_wals_info().keys(), default=None
+        )
+        return int(latest_timeline, 16) if latest_timeline else 1
 
     # TODO: merge with the previous
     def get_wal_until_next_backup(self, backup, include_history=False):
@@ -3046,11 +3437,21 @@ class Server(RemoteStatusMixin):
                 if os.path.exists(item.tmp_path):
                     os.unlink(item.tmp_path)
 
-    def cloud_wal_archive(self, wal_path):
+    def cloud_wal_archive(self, wal_path, parallel=0):
         """
         Archive a WAL file to a cloud object storage.
 
-        :param str wal_path: the path of the WAL file to archive
+        This method supports WAL prefetching: after the requested WAL is successfully
+        archived, it can spawn worker processes to opportunistically archive additional
+        WAL files that are marked as ready in pg_wal/archive_status/. This helps reduce
+        WAL archival backlog during periods of high WAL generation.
+
+        The method also maintains a cache of the last archived WAL name to enable early
+        exit when Postgres re-invokes archive_command for WALs that were already
+        prefetched.
+
+        :param str wal_path: The path of the WAL file to archive
+        :param int parallel: number of WALs to archive in parallel (0=disabled)
         """
         output.debug(
             "Starting cloud-wal-archive for WAL file %s on server %s",
@@ -3069,20 +3470,37 @@ class Server(RemoteStatusMixin):
         if not self.use_wal_cloud_storage:
             output.error(
                 "cloud-wal-archive is not supported for server %s because no cloud storage "
-                "configuration is set in 'wals_directory'. Please check the "
-                "configuration of server %s.",
-                self.config.name,
+                "configuration is set in 'wals_directory'. Please check the server "
+                "configuration.",
                 self.config.name,
             )
             return
 
-        self.backup_manager.cloud_wal_archive(wal_path)
+        self.backup_manager.cloud_wal_archive(wal_path, parallel)
 
         output.debug(
             "Finished cloud-wal-archive for WAL file %s on server %s",
             wal_path,
             self.config.name,
         )
+
+    def cloud_wal_restore(self, wal_name, wal_dest, spool_dir):
+        """
+        Restore a WAL file from a cloud object storage.
+
+        :param str wal_name: the name of the WAL file to restore
+        :param str wal_dest: the destination path where to restore the WAL file
+        :param str spool_dir: the spool directory for extra WALs fetched in parallel
+        """
+        if not self.use_wal_cloud_storage:
+            output.error(
+                "cloud-wal-restore is not supported for server %s because no cloud "
+                "storage configuration is set in 'wals_directory'. Please check the "
+                "configuration of the server." % self.config.name
+            )
+            return
+
+        self.backup_manager.cloud_wal_restore(wal_name, wal_dest, spool_dir)
 
     def cron(self, wals=True, retention_policies=True, keep_descriptors=False):
         """
@@ -3616,9 +4034,10 @@ class Server(RemoteStatusMixin):
                 pass
 
         if self.use_wal_cloud_storage:
-            output.error(
-                "Rebuilding xlogdb is not supported for servers using cloud storage"
-            )
+            if not silent:
+                output.error(
+                    "Rebuilding xlogdb is not supported for servers using cloud storage"
+                )
             return
 
         root = self.config.wals_directory
@@ -5000,7 +5419,7 @@ class Server(RemoteStatusMixin):
             # Spawn the receive-wal sub-process
             self.background_receive_wal(keep_descriptors=False)
 
-    def _get_errors_dst(self, file_name, suffix):
+    def get_errors_dst(self, file_name, suffix):
         """
         Get the destination path for an unknown or (mismatching) duplicate WAL file in
         the ``errors`` directory.
@@ -5046,31 +5465,11 @@ class Server(RemoteStatusMixin):
             * ``duplicate``: if *src* is a (mismatching) duplicate WAL file.
             * ``unknown``: if *src* is not an WAL file.
         """
-        error_dst = self._get_errors_dst(file_name, suffix)
+        error_dst = self.get_errors_dst(file_name, suffix)
         # TODO: cover corner case of duplication (unlikely,
         # but theoretically possible)
         try:
             shutil.move(src, error_dst)
-        except IOError as e:
-            if e.errno == errno.ENOENT:
-                _logger.warning("%s not found" % src)
-
-    def copy_wal_file_to_errors_directory(self, src, file_name, suffix):
-        """
-        Copy an unknown or (mismatching) duplicate WAL file to the ``errors`` directory.
-
-        .. note:
-            We aim to solve the same issue as :meth:`move_wal_file_to_errors_directory`,
-            but we want to keep the original file in place.
-
-            This is useful when running WAL archiving directly from ``pg_wal``, like we
-            do when using ``barman cloud-wal-archive``. Given the WAL file is inside
-            ``pg_wal``, we shouldn't move it to a different directory, but rather copy
-            it.
-        """
-        error_dst = self._get_errors_dst(file_name, suffix)
-        try:
-            shutil.copy(src, error_dst)
         except IOError as e:
             if e.errno == errno.ENOENT:
                 _logger.warning("%s not found" % src)

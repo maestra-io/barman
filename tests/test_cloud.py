@@ -23,6 +23,7 @@ import logging
 import os
 import shutil
 import sys
+import threading
 from argparse import Namespace
 from functools import partial
 from io import BytesIO
@@ -59,6 +60,7 @@ from barman.cloud import (
     CloudTarUploader,
     CloudUploadController,
     CloudUploadingError,
+    CloudWalDownloader,
     FileUploadStatistics,
 )
 from barman.cloud_providers import (
@@ -67,6 +69,7 @@ from barman.cloud_providers import (
     ObjectKeyAlreadyExists,
     get_cloud_interface,
     get_cloud_interface_from_server_config,
+    recognize_cloud_provider,
     validate_azure_blob_storage_url,
     validate_google_cloud_url,
     validate_s3_url,
@@ -74,7 +77,11 @@ from barman.cloud_providers import (
 from barman.cloud_providers.aws_s3 import S3CloudInterface
 from barman.cloud_providers.azure_blob_storage import AzureCloudInterface
 from barman.cloud_providers.google_cloud_storage import GoogleCloudInterface
-from barman.exceptions import BackupPreconditionException, ConfigurationException
+from barman.exceptions import (
+    BackupPreconditionException,
+    BarmanException,
+    ConfigurationException,
+)
 from barman.infofile import BackupInfo, WalFileInfo
 
 if sys.version_info.major > 2:
@@ -3098,6 +3105,53 @@ class TestGoogleCloudInterface(TestCase):
         container_client_mock.exists.side_effect = GoogleAPIError("error")
         assert cloud_interface.test_connectivity() is False
 
+    @mock.patch.dict(
+        os.environ, {"GOOGLE_CLOUD_UNIVERSE_DOMAIN": "custom.universe.domain"}
+    )
+    @mock.patch("barman.cloud_providers.google_cloud_storage.storage.Client")
+    def test_universe_domain_from_environment(self, gcs_client_mock):
+        """
+        Test that the universe domain is properly loaded from GOOGLE_CLOUD_UNIVERSE_DOMAIN
+        environment variable and passed to the storage client
+        """
+        # GIVEN a GoogleCloudInterface instance is created
+        cloud_interface = GoogleCloudInterface(
+            "https://console.cloud.google.com/storage/browser/barman-test/test"
+        )
+
+        # THEN the storage.Client should be called with the universe_domain in client_options
+        gcs_client_mock.assert_called_once_with(
+            client_options={"universe_domain": "custom.universe.domain"}
+        )
+
+        # AND the cloud interface should be properly initialized
+        assert cloud_interface.client == gcs_client_mock.return_value
+        assert (
+            cloud_interface.container_client
+            == gcs_client_mock.return_value.bucket.return_value
+        )
+
+    @mock.patch("barman.cloud_providers.google_cloud_storage.storage.Client")
+    def test_no_universe_domain_environment(self, gcs_client_mock):
+        """
+        Test that when GOOGLE_CLOUD_UNIVERSE_DOMAIN is not set, the storage client
+        is created without client_options
+        """
+        # GIVEN a GoogleCloudInterface instance is created without universe domain env var
+        cloud_interface = GoogleCloudInterface(
+            "https://console.cloud.google.com/storage/browser/barman-test/test"
+        )
+
+        # THEN the storage.Client should be called with client_options=None
+        gcs_client_mock.assert_called_once_with(client_options=None)
+
+        # AND the cloud interface should be properly initialized
+        assert cloud_interface.client == gcs_client_mock.return_value
+        assert (
+            cloud_interface.container_client
+            == gcs_client_mock.return_value.bucket.return_value
+        )
+
     @mock.patch("barman.cloud_providers.google_cloud_storage.storage.Client")
     def test_setup_bucket(self, gcs_client_mock):
         """
@@ -3844,9 +3898,9 @@ class TestCloudBackupCatalog(object):
     def get_backup_info_file_object(self):
         """Minimal backup info"""
         return BytesIO(b"""
-backup_label=None
-end_time=2014-12-22 09:25:27.410470+01:00
-""")
+            backup_label=None
+            end_time=2014-12-22 09:25:27.410470+01:00
+            """)
 
     def raise_exception(self):
         raise Exception("something went wrong reading backup.info")
@@ -4236,12 +4290,12 @@ end_time=2014-12-22 09:25:27.410470+01:00
     def catalog_with_named_backup(self, in_memory_cloud_interface):
         backup_infos = {
             "20221107T120000": BytesIO(b"""backup_label=None
-end_time=2022-11-07 12:05:00
-backup_name=named backup
-"""),
+                end_time=2022-11-07 12:05:00
+                backup_name=named backup
+                """),
             "20221109T120000": BytesIO(b"""backup_label=None
-end_time=2022-11-09 12:05:00
-"""),
+                end_time=2022-11-09 12:05:00
+                """),
         }
         in_memory_cloud_interface.path = ""
         for id, backup_info in backup_infos.items():
@@ -5776,3 +5830,1178 @@ def test_validate_google_cloud_url(url, is_valid):
 def test_validate_azure_blob_storage_url(url, is_valid):
     """Test the ``validate_azure_blob_storage_url`` function."""
     assert validate_azure_blob_storage_url(url) == is_valid
+
+
+@pytest.mark.parametrize(
+    ("url", "expected_provider"),
+    (
+        # AWS S3 URLs
+        ("s3://my-bucket/my-object", "aws-s3"),
+        ("s3://bucket-name", "aws-s3"),
+        # Google Cloud Storage URLs
+        ("gs://my-bucket/my-object", "google-cloud-storage"),
+        ("gs://bucket-name", "google-cloud-storage"),
+        # Azure Blob Storage URLs
+        (
+            "https://myaccount.blob.core.windows.net/mycontainer/myblob",
+            "azure-blob-storage",
+        ),
+        (
+            "https://anotheraccount.blob.core.windows.net/container/blob",
+            "azure-blob-storage",
+        ),
+        # Invalid URLs
+        ("http://example.com/bucket", None),
+        ("ftp://my-bucket/my-object", None),
+        ("s3:/my-bucket/my-object", None),
+        ("gs:/my-bucket/my-object", None),
+        ("https://myaccount.blob.core.windows.com/mycontainer/myblob", None),
+        ("", None),
+    ),
+)
+def test_recognize_cloud_provider(url, expected_provider):
+    """Test the ``recognize_cloud_provider`` function."""
+    assert recognize_cloud_provider(url) == expected_provider
+
+
+class TestCloudWalDownloader:
+    """
+    Tests for the :class:`CloudWalDownloader` class.
+    """
+
+    @pytest.mark.parametrize("custom_spool_dir", (None, "/custom/spool/dir"))
+    def test__init__(self, custom_spool_dir):
+        """Test that the CloudWalDownloader is initialized with the expected args."""
+        mock_cloud_interface = MagicMock()
+        server_name = "test_server"
+        downloader = CloudWalDownloader(
+            mock_cloud_interface, server_name, custom_spool_dir
+        )
+        assert downloader.cloud_interface == mock_cloud_interface
+        assert downloader.server_name == server_name
+        if custom_spool_dir:
+            assert downloader.spool_dir == custom_spool_dir
+        else:
+            assert downloader.spool_dir == CloudWalDownloader.DEFAULT_SPOOL_DIR
+
+    @mock.patch(
+        # No-op, no compression logic is tested here
+        "barman.cloud.CloudWalDownloader._remove_compression_suffix",
+        new=lambda x: x,
+    )
+    @mock.patch("barman.cloud.CloudWalDownloader._download_single_wal")
+    @mock.patch("barman.cloud.CloudWalDownloader._get_wals_to_download")
+    def test_download_wal_no_parallel(
+        self, mock_get_wals_to_download, mock_download_single_wal
+    ):
+        """
+        Test successful download of a single WAL file.
+        """
+        # Prepare mocks
+        # Simulate get_wals_to_download returning a single WAL path
+        wal_dir = "0000000100000001"
+        source_dir = "bucket/barman/test_server/wals/{}/".format(wal_dir)
+        requested_wal_name = "000000010000000100000001"
+        cloud_wal_path = source_dir + requested_wal_name
+        mock_get_wals_to_download.return_value = [cloud_wal_path]
+
+        # GIVEN a CloudWalDownloader
+        downloader = CloudWalDownloader(mock.Mock(), "test_server")
+
+        # WHEN download_wal is called
+        wal_dest = "/restore/path/000000010000000100000001"
+        downloader.download_wal(
+            requested_wal_name, wal_dest, no_partial=False, parallel=0
+        )
+
+        # THEN _download_single_wal is called with the expected args
+        mock_download_single_wal.assert_called_once_with(cloud_wal_path, wal_dest)
+
+    @mock.patch(
+        # No-op, no compression logic is tested here
+        "barman.cloud.CloudWalDownloader._remove_compression_suffix",
+        new=lambda self, x: x,
+    )
+    @mock.patch(
+        # No-op, we dont test the spool logic here
+        "barman.cloud.CloudWalDownloader._try_to_deliver_from_spool",
+        new=lambda x, y, z: False,
+    )
+    @mock.patch(
+        # No-op, we dont test the spool logic here
+        "barman.cloud.CloudWalDownloader._ensure_spool_dir_exists",
+        new=lambda self: None,
+    )
+    @mock.patch("barman.cloud.threading.Thread")
+    @mock.patch("barman.cloud.CloudWalDownloader._download_single_wal")
+    @mock.patch("barman.cloud.CloudWalDownloader._get_wals_to_download")
+    def test_download_wal_parallel(
+        self, mock_get_wals_to_download, mock_download_single_wal, mock_thread_class
+    ):
+        """
+        Test that download_wal starts parallel downloads for additional WAL files when
+        ``parallel > 1``. It should spawn a thread for each additional WAL.
+        """
+        # Prepare mocks
+        # Simulate get_wals_to_download returning multiple WAL paths (requested + 2 more)
+        wal_dir = "0000000100000001"
+        source_dir = "bucket/barman/test_server/wals/{}/".format(wal_dir)
+        requested_wal_name = "000000010000000100000001"
+        extra_wal_1 = "000000010000000100000002"
+        extra_wal_2 = "000000010000000100000003"
+        mock_get_wals_to_download.return_value = [
+            source_dir + requested_wal_name,
+            source_dir + extra_wal_1,
+            source_dir + extra_wal_2,
+        ]
+
+        # GIVEN a CloudWalDownloader
+        downloader = CloudWalDownloader(mock.Mock(), "test_server", "/path/to/spool")
+
+        # WHEN download_wal is called with parallel=3
+        wal_dest = "/restore/path/000000010000000100000001"
+        downloader.download_wal(
+            requested_wal_name, wal_dest, no_partial=False, parallel=3
+        )
+
+        # THEN a thread is started for each additional WAL file
+        # We also assert each thread has been started and joined
+        mock_thread_class.assert_has_calls(
+            [
+                mock.call(
+                    target=downloader._download_single_wal,
+                    args=(
+                        source_dir + extra_wal_1,
+                        "/path/to/spool/{}".format(extra_wal_1),
+                    ),
+                ),
+                mock.call().start(),
+                mock.call(
+                    target=downloader._download_single_wal,
+                    args=(
+                        source_dir + extra_wal_2,
+                        "/path/to/spool/{}".format(extra_wal_2),
+                    ),
+                ),
+                mock.call().start(),
+                mock.call().join(),
+                mock.call().join(),
+            ]
+        )
+
+        # AND _download_single_wal is called in the main thread for the requested WAL
+        mock_download_single_wal.assert_called_once_with(
+            source_dir + requested_wal_name, wal_dest
+        )
+
+    @mock.patch(
+        # No-op, we dont test the spool logic here
+        "barman.cloud.CloudWalDownloader._try_to_deliver_from_spool",
+        new=lambda x, y, z: False,
+    )
+    @mock.patch(
+        # No-op, we dont test the spool logic here
+        "barman.cloud.CloudWalDownloader._ensure_spool_dir_exists",
+        new=lambda self: None,
+    )
+    @mock.patch("barman.cloud.threading.Thread")
+    @mock.patch("barman.cloud.CloudWalDownloader._remove_compression_suffix")
+    @mock.patch("barman.cloud.CloudWalDownloader._download_single_wal")
+    @mock.patch("barman.cloud.CloudWalDownloader._get_wals_to_download")
+    def test_download_wal_parallel_partial_and_compressed(
+        self,
+        mock_get_wals_to_download,
+        mock_download_single_wal,
+        mock_remove_compression_suffix,
+        mock_thread_class,
+    ):
+        """
+        Test that download_wal starts parallel downloads for additional WAL files when
+        ``parallel > 1``. In this case, the requested WALs contains a compressed and
+        a partial suffix, which should be removed before saving the file locally.
+        """
+        # Prepare mocks
+        # Simulate get_wals_to_download returning multiple WAL paths (requested + 2 more)
+        # Where one is standard, one compressed, one partial and one is a history file
+        wal_dir = "0000000100000001"
+        source_dir = "bucket/barman/test_server/wals/{}/".format(wal_dir)
+        requested_wal_name = "000000010000000100000001"
+        extra_wal_1 = "000000010000000100000002.gz"
+        extra_wal_2 = "000000010000000100000003.partial"
+        mock_get_wals_to_download.return_value = [
+            source_dir + requested_wal_name,
+            source_dir + extra_wal_1,
+            source_dir + extra_wal_2,
+        ]
+        # Mock _remove_compression_suffix the compression of the only compressed WAL file
+        mock_remove_compression_suffix.side_effect = lambda x: x.replace(".gz", "")
+
+        # GIVEN a CloudWalDownloader
+        downloader = CloudWalDownloader(mock.Mock(), "test_server", "/path/to/spool")
+
+        # WHEN download_wal is called with parallel=4
+        wal_dest = "/restore/path/000000010000000100000001"
+        downloader.download_wal(
+            requested_wal_name, wal_dest, no_partial=False, parallel=3
+        )
+
+        # THEN a thread is started for each additional WAL file
+        # The WALs destination should have the compression and partial suffixes removed
+        mock_thread_class.assert_has_calls(
+            [
+                mock.call(
+                    target=downloader._download_single_wal,
+                    args=(
+                        source_dir + extra_wal_1,
+                        "/path/to/spool/000000010000000100000002",
+                    ),
+                ),
+                mock.call().start(),
+                mock.call(
+                    target=downloader._download_single_wal,
+                    args=(
+                        source_dir + extra_wal_2,
+                        "/path/to/spool/000000010000000100000003",
+                    ),
+                ),
+                mock.call().start(),
+                mock.call().join(),
+                mock.call().join(),
+            ]
+        )
+
+        # AND _download_single_wal is called in the main thread for the requested WAL
+        mock_download_single_wal.assert_called_once_with(
+            source_dir + requested_wal_name, wal_dest
+        )
+
+    @mock.patch("barman.cloud.CloudWalDownloader._get_wals_to_download")
+    def test_download_wal_not_found(self, mock_get_wals_to_download):
+        """
+        Test that download_wal raises OperationErrorExit when WAL not found.
+        """
+        # GIVEN a CloudWalDownloader
+        downloader = CloudWalDownloader(mock.Mock(), "test_server")
+
+        # Parameters for the test
+        requested_wal_name = "000000010000000100000001"
+        wal_dest = "/restore/path/000000010000000100000001"
+
+        # Case 1: No WALs found at all
+        # WHEN download_wal is called
+        # THEN OperationErrorExit is raised
+        mock_get_wals_to_download.return_value = []
+        with pytest.raises(OperationErrorExit):
+            downloader.download_wal(
+                requested_wal_name, wal_dest, no_partial=False, parallel=0
+            )
+
+        # Case 2: WALs found but not the requested one
+        mock_get_wals_to_download.return_value = [
+            "bucket/barman/test_server/wals/0000000100000001/000000010000000100000002"
+        ]
+        # WHEN download_wal is called
+        # THEN OperationErrorExit is raised
+        with pytest.raises(OperationErrorExit):
+            downloader.download_wal(
+                requested_wal_name, wal_dest, no_partial=False, parallel=2
+            )
+
+    @pytest.mark.parametrize("parallel", [0, 1])
+    def test_get_wals_to_download_no_parallel(self, parallel):
+        """
+        Test that _get_wals_to_download returns the correct WAL when parallelism
+        is disabled i.e. ``parallel=0`` or ``parallel=1``.
+        """
+        # Prepare mocks
+        # Simulate a cloud interface that lists a single WAL file
+        # This is the expected behavior when list_bucket is called with the
+        # full WAL path as prefix
+        mock_cloud_interface = MagicMock()
+        mock_cloud_interface.path = "bucket/barman"
+        wal_name = "000000010000000100000001"
+        wal_dir = "0000000100000001"
+        wal_path = "bucket/barman/test_server/wals/{}/{}".format(wal_dir, wal_name)
+        mock_cloud_interface.list_bucket.return_value = [wal_path]
+
+        # GIVEN a CloudWalDownloader with the mocked cloud interface
+        downloader = CloudWalDownloader(mock_cloud_interface, "test_server")
+
+        # WHEN _get_wals_to_download is called with disabled parallelism
+        result = downloader._get_wals_to_download(
+            wal_name, no_partial=False, parallel=parallel
+        )
+
+        # THEN the expected WAL path is returned
+        assert result == [wal_path]
+        # AND list_bucket was called with the full WAL path as prefix
+        mock_cloud_interface.list_bucket.assert_called_once_with(wal_path)
+
+    def test_get_wals_to_download_parallel(self):
+        """
+        Test that _get_wals_to_download returns multiple WALs when ``parallel > 1``.
+        """
+        # Prepare mocks
+        # Simulate a cloud interface that lists multiple WALs in the same directory
+        # This is the expected behavior when list_bucket is called with the
+        # WAL directory as prefix
+        mock_cloud_interface = MagicMock()
+        mock_cloud_interface.path = "bucket/barman"
+        requested_wal_name = "000000010000000100000002"
+        wal_dir = "0000000100000001"
+        source_dir = "bucket/barman/test_server/wals/{}/".format(wal_dir)
+        wal_paths = [
+            source_dir + "000000010000000100000001",
+            source_dir + "000000010000000100000002",
+            source_dir + "000000010000000100000003",
+            source_dir + "000000010000000100000004",
+            source_dir + "000000010000000100000005",
+        ]
+        mock_cloud_interface.list_bucket.return_value = wal_paths
+
+        # GIVEN a CloudWalDownloader with the mocked cloud interface
+        downloader = CloudWalDownloader(mock_cloud_interface, "test_server")
+
+        # WHEN _get_wals_to_download is called with parallel=3
+        result = downloader._get_wals_to_download(
+            requested_wal_name, no_partial=False, parallel=3
+        )
+
+        # THEN the expected WAL paths are returned (requested + the following 2)
+        assert result == wal_paths[1:4]
+        # AND list_bucket was called with the directory as prefix
+        mock_cloud_interface.list_bucket.assert_called_once_with(source_dir)
+
+    @mock.patch("barman.cloud.CloudWalDownloader._validate_wal_path")
+    def test_get_wals_to_download_skips_invalid(self, mock_validate_wal_path):
+        """
+        Test that _get_wals_to_download skips invalid WAL paths.
+        """
+        # Prepare mocks
+        # Simulate a cloud interface that lists a valid WAL and an invalid file
+        mock_cloud_interface = MagicMock()
+        mock_cloud_interface.path = "bucket/barman"
+        requested_wal_name = "000000010000000100000002"
+        wal_dir = "0000000100000001"
+        source_dir = "bucket/barman/test_server/wals/{}/".format(wal_dir)
+        valid_wal = source_dir + requested_wal_name
+        invalid_file = source_dir + "invalid_file.txt"
+        mock_cloud_interface.list_bucket.return_value = [valid_wal, invalid_file]
+        # Mock _validate_wal_path to return True for the valid and False for the invalid
+        mock_validate_wal_path.side_effect = [True, False]
+
+        # GIVEN a CloudWalDownloader with mixed valid and invalid WAL paths
+        downloader = CloudWalDownloader(mock_cloud_interface, "test_server")
+
+        # WHEN _get_wals_to_download is called with parallel=2
+        result = downloader._get_wals_to_download(
+            requested_wal_name, no_partial=False, parallel=2
+        )
+
+        # THEN only the valid WAL path is returned
+        assert result == [valid_wal]
+
+        # Assert that _validate_wal_path was called for both paths
+        mock_validate_wal_path.assert_has_calls(
+            [mock.call(valid_wal, False), mock.call(invalid_file, False)]
+        )
+
+    def test_get_wals_to_download_list_bucket_out_of_order(self):
+        """
+        Test that _get_wals_to_download returns consistent results even when
+        list_bucket returns WAL paths out of order.
+
+        The method should always return the requested WAL followed by the next
+        N - 1 WALs in sorted order, regardless of the order returned by list_bucket.
+        """
+        # Prepare mocks
+        # Simulate a cloud interface that returns WAL paths out of order
+        mock_cloud_interface = MagicMock()
+        mock_cloud_interface.path = "bucket/barman"
+        wal_dir = "0000000100000001"
+        source_dir = "bucket/barman/test_server/wals/{}/".format(wal_dir)
+        mock_cloud_interface.list_bucket.return_value = [
+            source_dir + "000000010000000100000005",
+            source_dir + "000000010000000100000002",
+            source_dir + "000000010000000100000001",
+            source_dir + "000000010000000100000004",
+            source_dir + "000000010000000100000003",
+        ]
+
+        # AND a CloudWalDownloader with the mocked cloud interface
+        downloader = CloudWalDownloader(mock_cloud_interface, "test_server")
+
+        # WHEN _get_wals_to_download is called with parallel=3
+        requested_wal_name = "000000010000000100000002"
+        result = downloader._get_wals_to_download(
+            requested_wal_name, no_partial=False, parallel=3
+        )
+
+        # THEN the result contains the requested WAL + the next 2 WALs in sorted order
+        assert result == [
+            source_dir + "000000010000000100000002",
+            source_dir + "000000010000000100000003",
+            source_dir + "000000010000000100000004",
+        ]
+
+    def test_get_wals_to_download_empty(self):
+        """
+        Test that _get_wals_to_download returns empty list when no WALs found.
+        """
+        # GIVEN a CloudWalDownloader with no WALs in the bucket
+        mock_cloud_interface = MagicMock()
+        mock_cloud_interface.path = "bucket/barman"
+        mock_cloud_interface.list_bucket.return_value = []
+        downloader = CloudWalDownloader(mock_cloud_interface, "test_server")
+
+        # WHEN _get_wals_to_download is called
+        result = downloader._get_wals_to_download(
+            "000000010000000000000001", no_partial=False, parallel=1
+        )
+
+        # THEN an empty list is returned
+        assert result == []
+
+    def test_get_wals_to_download_finds_compressed_wal_with_backup_label(self):
+        """
+        Test that _get_wals_to_download finds the requested compressed WAL even
+        when a sibling ``<wal>.<offset>.backup`` label file lives next to it in
+        the bucket.
+
+        Example scenario:
+            A user requests 00000001000000030000001A. The bucket holds both
+            00000001000000030000001A.gz (the actual WAL) and
+            00000001000000030000001A.00000028.backup.gz (the backup label).
+            S3 list_bucket returns them sorted, and the backup label sorts
+            before the WAL because ``.0`` < ``.g`` in ASCII. The downloader
+            must still return the real WAL.
+        """
+        # GIVEN a cloud bucket holding both the WAL and its sibling .backup label
+        mock_cloud_interface = MagicMock()
+        mock_cloud_interface.path = "bucket/barman"
+        wal_dir = "0000000100000003"
+        source_dir = "bucket/barman/test_server/wals/{}/".format(wal_dir)
+        # sorted() order — the .backup label appears before the .gz WAL
+        mock_cloud_interface.list_bucket.return_value = [
+            source_dir + "00000001000000030000001A.00000028.backup.gz",
+            source_dir + "00000001000000030000001A.gz",
+        ]
+
+        # AND a CloudWalDownloader
+        downloader = CloudWalDownloader(mock_cloud_interface, "test_server")
+
+        # WHEN _get_wals_to_download is called for the WAL
+        result = downloader._get_wals_to_download(
+            "00000001000000030000001A", no_partial=False, parallel=1
+        )
+
+        # THEN the actual WAL is returned
+        assert result == [source_dir + "00000001000000030000001A.gz"]
+
+    @mock.patch(
+        "barman.cloud.CloudWalDownloader._validate_wal_path",
+        side_effect=[False, True, True],
+    )
+    def test_get_wals_to_download_returns_empty_list_when_requested_wal_is_invalid(
+        self,
+        mock_validate_wal_path,
+    ):
+        """
+        Test that _get_wals_to_download returns an empty list when the requested
+        WAL is invalid (a backup file in this test).
+
+        Example scenario:
+            A user requests a WAL like 00000001000000030000001A with parallel
+            pre-fetching, but only 00000001000000030000001A.00000028.backup exists in
+            cloud storage. The method should exit immediately without returning any
+            subsequent WAL files.
+        """
+        # GIVEN a cloud bucket where the requested WAL only exists as a backup file
+        mock_cloud_interface = MagicMock()
+        mock_cloud_interface.path = "bucket/barman"
+        wal_dir = "0000000100000003"
+        source_dir = "bucket/barman/test_server/wals/{}/".format(wal_dir)
+        mock_cloud_interface.list_bucket.return_value = [
+            source_dir + "00000001000000030000001A.00000028.backup",
+            source_dir + "00000001000000030000001B",
+            source_dir + "00000001000000030000001C",
+        ]
+
+        # AND a CloudWalDownloader
+        downloader = CloudWalDownloader(mock_cloud_interface, "test_server")
+
+        # WHEN _get_wals_to_download is called for the WAL that only exists as backup
+        result = downloader._get_wals_to_download(
+            "00000001000000030000001A", no_partial=False, parallel=3
+        )
+
+        # THEN an empty list is returned (doesn't include the following WALs)
+        assert result == []
+
+    def test_get_wals_to_download_mixed_file_types(self):
+        """
+        Test that _get_wals_to_download correctly handles a directory containing a
+        mix of WAL files with different compressions, backup files (including
+        compressed), and partial files.
+
+        This is an integration-style test that exercises the real
+        :meth:`_validate_wal_path` and :meth:`_remove_compression_suffix` methods
+        without mocks.
+        """
+        # Prepare mocks
+        # Simulate a cloud bucket mirroring a realistic WAL directory with mixed
+        # file types and compression formats
+        mock_cloud_interface = MagicMock()
+        mock_cloud_interface.path = "bucket/barman"
+        wal_dir = "0000000100000002"
+        source_dir = "bucket/barman/test_server/wals/{}/".format(wal_dir)
+        mock_cloud_interface.list_bucket.return_value = [
+            source_dir + "0000000100000002000000D1.gz",
+            source_dir + "0000000100000002000000D2",
+            source_dir + "0000000100000002000000D3.00000028.backup.zst",
+            source_dir + "0000000100000002000000D3.bz2",
+            source_dir + "0000000100000002000000D4.xz",
+            source_dir + "0000000100000002000000D5.00000028.backup",
+            source_dir + "0000000100000002000000D5.lz4",
+            source_dir + "0000000100000002000000D6.zst",
+            source_dir + "0000000100000002000000D7.partial",
+            source_dir + "0000000100000002000000D8.partial.zst",
+        ]
+
+        # GIVEN a CloudWalDownloader with the mocked cloud interface
+        downloader = CloudWalDownloader(mock_cloud_interface, "test_server")
+
+        # WHEN _get_wals_to_download is called with parallel=4
+        result = downloader._get_wals_to_download(
+            "0000000100000002000000D1", no_partial=False, parallel=4
+        )
+
+        # THEN backup files are skipped and do not consume count slots, and the
+        # result contains the requested WAL + the next 3 valid WALs
+        assert result == [
+            source_dir + "0000000100000002000000D1.gz",
+            source_dir + "0000000100000002000000D2",
+            source_dir + "0000000100000002000000D3.bz2",
+            source_dir + "0000000100000002000000D4.xz",
+        ]
+
+    def test_get_wals_to_download_parallel_exceeds_available(self):
+        """
+        Test that _get_wals_to_download returns all valid WALs when parallel
+        exceeds the number of available files in the directory.
+        """
+        # Prepare mocks
+        # Simulate a bucket with mixed file types and a high parallel value
+        mock_cloud_interface = MagicMock()
+        mock_cloud_interface.path = "bucket/barman"
+        wal_dir = "0000000100000002"
+        source_dir = "bucket/barman/test_server/wals/{}/".format(wal_dir)
+        mock_cloud_interface.list_bucket.return_value = [
+            source_dir + "0000000100000002000000D1.gz",
+            source_dir + "0000000100000002000000D2",
+            source_dir + "0000000100000002000000D3.00000028.backup.zst",
+            source_dir + "0000000100000002000000D3.bz2",
+            source_dir + "0000000100000002000000D4.xz",
+            source_dir + "0000000100000002000000D5.00000028.backup",
+            source_dir + "0000000100000002000000D5.lz4",
+            source_dir + "0000000100000002000000D6.zst",
+            source_dir + "0000000100000002000000D7.partial",
+            source_dir + "0000000100000002000000D8.partial.zst",
+        ]
+
+        # GIVEN a CloudWalDownloader with the mocked cloud interface
+        downloader = CloudWalDownloader(mock_cloud_interface, "test_server")
+
+        # WHEN _get_wals_to_download is called with parallel=20 (more than available)
+        result = downloader._get_wals_to_download(
+            "0000000100000002000000D1", no_partial=False, parallel=20
+        )
+
+        # THEN all valid WAL files are returned (backup files excluded)
+        assert result == [
+            source_dir + "0000000100000002000000D1.gz",
+            source_dir + "0000000100000002000000D2",
+            source_dir + "0000000100000002000000D3.bz2",
+            source_dir + "0000000100000002000000D4.xz",
+            source_dir + "0000000100000002000000D5.lz4",
+            source_dir + "0000000100000002000000D6.zst",
+            source_dir + "0000000100000002000000D7.partial",
+            source_dir + "0000000100000002000000D8.partial.zst",
+        ]
+
+    def test_get_wals_to_download_history_file_disables_prefetch(self):
+        """
+        Test that _get_wals_to_download disables prefetching when the requested
+        WAL is a history file.
+
+        History files live in the root of the "wals" directory instead of a
+        hashed directory, so prefetching is not possible.
+        """
+        # Prepare mocks
+        # Simulate a cloud interface that returns a history
+        mock_cloud_interface = MagicMock()
+        mock_cloud_interface.path = "bucket/barman"
+        history_file = "00000002.history"
+        history_path = "bucket/barman/test_server/wals/{}".format(history_file)
+        mock_cloud_interface.list_bucket.return_value = [history_path]
+
+        # AND a CloudWalDownloader with the mocked cloud interface
+        downloader = CloudWalDownloader(mock_cloud_interface, "test_server")
+
+        # WHEN _get_wals_to_download is called with parallel=3 for a history file
+        result = downloader._get_wals_to_download(
+            history_file, no_partial=False, parallel=3
+        )
+
+        # THEN only the history file is returned (no prefetching)
+        assert result == [history_path]
+
+        # AND list_bucket was called with the full history file path as prefix
+        # (not the directory). This indicates that prefetching is disabled
+        expected_prefix = "bucket/barman/test_server/wals/{}".format(history_file)
+        mock_cloud_interface.list_bucket.assert_called_once_with(expected_prefix)
+
+    @pytest.mark.parametrize(
+        ("wal_path", "no_partial", "expected_valid"),
+        [
+            # Valid WAL segments
+            ("000000010000000000000001", False, True),
+            ("000000010000000000000001", True, True),
+            # Valid compressed WAL segments
+            ("000000010000000000000001.gz", False, True),
+            ("000000010000000000000001.bz2", True, True),
+            # Partial files
+            ("000000010000000000000001.partial", False, True),
+            ("000000010000000000000001.partial", True, False),
+            # Backup files should be skipped
+            ("000000010000000000000001.00000028.backup", False, False),
+            ("000000010000000000000001.00000028.backup", True, False),
+            # Compressed backup files should also be skipped
+            ("000000010000000000000001.00000028.backup.zst", False, False),
+            ("000000010000000000000001.00000028.backup.gz", True, False),
+            # Compressed partial files
+            ("000000010000000000000001.partial.zst", False, True),
+            ("000000010000000000000001.partial.zst", True, False),
+            # History files are valid
+            ("00000001.history", False, True),
+            ("00000001.history", True, True),
+            # Compressed history files are valid
+            ("00000001.history.snappy", False, True),
+            ("00000001.history.gz", True, True),
+            # Invalid/unknown files
+            ("invalid_file.txt", False, False),
+            ("random_data", False, False),
+        ],
+    )
+    @mock.patch("barman.cloud.CloudWalDownloader._remove_compression_suffix")
+    def test_validate_wal_path(
+        self, mock_remove_compression_suffix, wal_path, no_partial, expected_valid
+    ):
+        """
+        Test that _validate_wal_path correctly identifies valid/invalid WAL paths.
+        """
+        # Prepare mocks
+        # Mock _remove_compression_suffix to remove compression suffixes
+        # from the testing WAL paths
+        mock_remove_compression_suffix.side_effect = (
+            lambda x: x.replace(".snappy", "")
+            .replace(".gz", "")
+            .replace(".bz2", "")
+            .replace(".zst", "")
+        )
+        # GIVEN a CloudWalDownloader instance
+        mock_cloud_interface = MagicMock()
+        downloader = CloudWalDownloader(mock_cloud_interface, "test_server")
+
+        # WHEN _validate_wal_path is called
+        result = downloader._validate_wal_path(wal_path, no_partial)
+
+        # THEN the expected validity is returned
+        assert result == expected_valid
+
+    @pytest.mark.parametrize(
+        ("wal_path", "expected_result"),
+        [
+            # Uncompressed WAL - no change
+            ("000000010000000000000001", "000000010000000000000001"),
+            # Compressed WAL segments
+            ("000000010000000000000001.gz", "000000010000000000000001"),
+            ("000000010000000000000001.bz2", "000000010000000000000001"),
+            ("000000010000000000000001.xz", "000000010000000000000001"),
+            ("000000010000000000000001.snappy", "000000010000000000000001"),
+            ("000000010000000000000001.zst", "000000010000000000000001"),
+            ("000000010000000000000001.lz4", "000000010000000000000001"),
+            # Full paths with compression
+            (
+                "/some/path/000000010000000000000001.gz",
+                "/some/path/000000010000000000000001",
+            ),
+            (
+                "bucket/barman/server/wals/0000000100000001/000000010000000100000001.bz2",
+                "bucket/barman/server/wals/0000000100000001/000000010000000100000001",
+            ),
+            # History files with compression
+            ("00000001.history.gz", "00000001.history"),
+            ("00000001.history.zst", "00000001.history"),
+            # Backup files with compression
+            (
+                "000000010000000000000001.00000028.backup.zst",
+                "000000010000000000000001.00000028.backup",
+            ),
+            (
+                "000000010000000000000001.00000028.backup.gz",
+                "000000010000000000000001.00000028.backup",
+            ),
+            # Partial files with compression
+            (
+                "000000010000000000000001.partial.zst",
+                "000000010000000000000001.partial",
+            ),
+            (
+                "000000010000000000000001.partial.lz4",
+                "000000010000000000000001.partial",
+            ),
+            # Unknown extensions - no change
+            ("000000010000000000000001.unknown", "000000010000000000000001.unknown"),
+        ],
+    )
+    def test_remove_compression_suffix(self, wal_path, expected_result):
+        """
+        Test that _remove_compression_suffix correctly strips compression extensions.
+        """
+        # GIVEN a CloudWalDownloader instance
+        mock_cloud_interface = MagicMock()
+        downloader = CloudWalDownloader(mock_cloud_interface, "test_server")
+
+        # WHEN _remove_compression_suffix is called
+        result = downloader._remove_compression_suffix(wal_path)
+
+        # THEN the compression suffix is removed (or path unchanged if no suffix)
+        assert result == expected_result
+
+    @mock.patch("barman.cloud.CloudWalDownloader._identify_cloud_compression")
+    def test_download_single_wal(self, mock_identify_compression):
+        """
+        Test that _download_single_wal calls the cloud interface correctly.
+        """
+        # Prepare mocks
+        mock_cloud_interface = MagicMock()
+        mock_identify_compression.return_value = "gzip"
+
+        # GIVEN a CloudWalDownloader with the mocked cloud interface
+        downloader = CloudWalDownloader(mock_cloud_interface, "test_server")
+
+        # WHEN _download_single_wal is called
+        cloud_wal_path = "bucket/barman/test_server/wals/0000000100000001/000000010000000100000001.gz"
+        wal_dest = "/restore/path/0000000100000001/000000010000000100000001"
+        downloader._download_single_wal(cloud_wal_path, wal_dest)
+
+        # THEN the cloud interface's download_file is called with the expected args
+        mock_cloud_interface.download_file.assert_called_once_with(
+            cloud_wal_path, wal_dest, "gzip"
+        )
+
+    @mock.patch("barman.cloud.sys")
+    def test_download_single_wal_python2_compressed_raises(self, mock_sys):
+        """
+        Test that _download_single_wal raises BarmanException for compressed
+        WALs on Python 2.
+        """
+        # GIVEN Python 2 environment
+        mock_sys.version_info = (2, 7, 0)
+        mock_cloud_interface = MagicMock()
+        downloader = CloudWalDownloader(mock_cloud_interface, "test_server")
+
+        # WHEN _download_single_wal is called with a compressed WAL
+        # THEN BarmanException is raised
+        with pytest.raises(BarmanException) as exc_info:
+            downloader._download_single_wal(
+                "/path/000000010000000000000001.gz",
+                "/restore/path/000000010000000000000001",
+            )
+        assert "Python 2.x" in str(exc_info.value)
+
+    @mock.patch(
+        "barman.cloud.CloudWalDownloader._identify_cloud_compression",
+        new=lambda self, x: None,  # No-op
+    )
+    @pytest.mark.parametrize(
+        "is_main_thread, should_reraise",
+        [
+            (True, True),  # Main thread should re-raise exceptions
+            (False, False),  # Worker thread should not re-raise exceptions
+        ],
+    )
+    @mock.patch("barman.cloud._logger")
+    @mock.patch("barman.cloud.threading.current_thread")
+    def test_download_single_wal_exception_main_thread_reraises(
+        self,
+        mock_current_thread,
+        mock_logger,
+        is_main_thread,
+        should_reraise,
+    ):
+        """
+        Test that _download_single_wal ALWAYS logs errors and only re-raises exceptions
+        when running on the main thread.
+        """
+        # Prepare mocks
+        # Simulate running on main thread or worker thread based on is_main_thread
+        mock_current_thread.return_value = (
+            threading.main_thread() if is_main_thread else threading.Thread()
+        )
+
+        # GIVEN a cloud interface that raises an exception during download
+        mock_cloud_interface = MagicMock()
+        mock_cloud_interface.download_file.side_effect = Exception("Download failed")
+        downloader = CloudWalDownloader(mock_cloud_interface, "test_server")
+
+        # WHEN _download_single_wal is called on the main thread
+        # THEN the exception is re-raised
+        if should_reraise:
+            with pytest.raises(Exception) as exc_info:
+                downloader._download_single_wal(
+                    "bucket/barman/test_server/wals/0000000100000001/000000010000000100000001",
+                    "/restore/path/000000010000000100000001",
+                )
+            assert "Download failed" in str(exc_info.value)
+        # WHEN _download_single_wal is called on a worker thread
+        # THEN the exception is NOT re-raised but is logged
+        else:
+            downloader._download_single_wal(
+                "bucket/barman/test_server/wals/0000000100000001/000000010000000100000001",
+                "/restore/path/000000010000000100000001",
+            )
+
+        # In any case, the error should be logged
+        mock_logger.error.assert_called_once_with(
+            "Failure downloading WAL %s to %s: %s"
+            % (
+                "bucket/barman/test_server/wals/0000000100000001/000000010000000100000001",
+                "/restore/path/000000010000000100000001",
+                "Download failed",
+            )
+        )
+
+    @pytest.mark.parametrize(
+        ("wal_path", "expected_compression"),
+        [
+            ("000000010000000000000001.gz", "gzip"),
+            ("000000010000000000000001.bz2", "bzip2"),
+            ("000000010000000000000001.xz", "xz"),
+            ("000000010000000000000001.snappy", "snappy"),
+            ("000000010000000000000001.zst", "zstd"),
+            ("000000010000000000000001.lz4", "lz4"),
+            ("000000010000000000000001", None),
+            ("/some/path/000000010000000000000001.gz", "gzip"),
+            ("/some/path/000000010000000000000001", None),
+        ],
+    )
+    def test_identify_cloud_compression(self, wal_path, expected_compression):
+        """
+        Test that _identify_cloud_compression correctly identifies compression
+        based on file extension.
+        """
+        # GIVEN a CloudWalDownloader instance
+        mock_cloud_interface = MagicMock()
+        downloader = CloudWalDownloader(mock_cloud_interface, "test_server")
+
+        # WHEN _identify_cloud_compression is called
+        result = downloader._identify_cloud_compression(wal_path)
+
+        # THEN the expected compression is returned
+        assert result == expected_compression
+
+    @mock.patch("barman.cloud.shutil.move")
+    @mock.patch("barman.cloud.os.path.isfile")
+    def test_try_to_deliver_from_spool_success(self, mock_isfile, mock_move):
+        """
+        Test that _try_to_deliver_from_spool moves WAL from spool and returns True.
+        """
+        # GIVEN a CloudWalDownloader with a WAL file in the spool directory
+        mock_isfile.return_value = True
+        downloader = CloudWalDownloader(mock.Mock(), "test_server", "/spool/dir")
+
+        # WHEN _try_to_deliver_from_spool is called
+        wal_name = "000000010000000100000001"
+        destination = "/restore/path/000000010000000100000001"
+        result = downloader._try_to_deliver_from_spool(wal_name, destination)
+
+        # THEN the file is moved and True is returned
+        assert result is True
+        mock_isfile.assert_called_once_with("/spool/dir/000000010000000100000001")
+        mock_move.assert_called_once_with(
+            "/spool/dir/000000010000000100000001", destination
+        )
+
+    @mock.patch("barman.cloud.os.path.isfile")
+    def test_try_to_deliver_from_spool_not_found(self, mock_isfile):
+        """
+        Test that _try_to_deliver_from_spool returns False when WAL not in spool.
+        """
+        # GIVEN a CloudWalDownloader with no WAL file in the spool directory
+        mock_isfile.return_value = False
+        downloader = CloudWalDownloader(mock.Mock(), "test_server", "/spool/dir")
+
+        # WHEN _try_to_deliver_from_spool is called
+        wal_name = "000000010000000100000001"
+        destination = "/restore/path/000000010000000100000001"
+        result = downloader._try_to_deliver_from_spool(wal_name, destination)
+
+        # THEN False is returned and no move is attempted
+        assert result is False
+        mock_isfile.assert_called_once_with("/spool/dir/000000010000000100000001")
+
+    @mock.patch("barman.cloud.shutil.move")
+    @mock.patch("barman.cloud.os.path.isfile")
+    def test_try_to_deliver_from_spool_move_error(self, mock_isfile, mock_move):
+        """
+        Test that _try_to_deliver_from_spool exits with code 2 when move fails.
+        """
+        # GIVEN a CloudWalDownloader where shutil.move raises an OSError
+        mock_isfile.return_value = True
+        mock_move.side_effect = OSError("Permission denied")
+        downloader = CloudWalDownloader(mock.Mock(), "test_server", "/spool/dir")
+
+        # WHEN _try_to_deliver_from_spool is called
+        # THEN SystemExit with code 2 is raised
+        wal_name = "000000010000000100000001"
+        destination = "/restore/path/000000010000000100000001"
+        with pytest.raises(SystemExit) as exc_info:
+            downloader._try_to_deliver_from_spool(wal_name, destination)
+        assert exc_info.value.code == 2
+
+    @mock.patch("barman.cloud.os.makedirs")
+    @mock.patch("barman.cloud.os.path.exists")
+    def test_ensure_spool_dir(self, mock_exists, mock_makedirs):
+        """
+        Test that _ensure_spool_dir_exists creates directory when it doesn't exist.
+        """
+        # GIVEN a CloudWalDownloader where spool directory does not exist
+        mock_exists.return_value = False
+        downloader = CloudWalDownloader(mock.Mock(), "test_server", "/spool/dir")
+
+        # WHEN _ensure_spool_dir_exists is called
+        downloader._ensure_spool_dir_exists()
+
+        # THEN os.makedirs is called with the spool directory
+        mock_exists.assert_called_once_with("/spool/dir")
+        mock_makedirs.assert_called_once_with("/spool/dir")
+
+    @mock.patch("barman.cloud.os.makedirs")
+    @mock.patch("barman.cloud.os.path.exists")
+    def test_ensure_spool_dir_exists_makedirs_error(self, mock_exists, mock_makedirs):
+        """
+        Test that _ensure_spool_dir_exists exits with code 2 when makedirs fails.
+        """
+        # GIVEN a CloudWalDownloader where os.makedirs raises an OSError
+        mock_exists.return_value = False
+        mock_makedirs.side_effect = OSError("Permission denied")
+        downloader = CloudWalDownloader(mock.Mock(), "test_server", "/spool/dir")
+
+        # WHEN _ensure_spool_dir_exists is called
+        # THEN SystemExit with code 2 is raised
+        with pytest.raises(SystemExit) as exc_info:
+            downloader._ensure_spool_dir_exists()
+        assert exc_info.value.code == 2
+
+
+class TestCoordinateBackupStartedUpload(object):
+    """Tests that coordinate_backup uploads backup.info with STARTED status."""
+
+    server_name = "test_server"
+
+    @mock.patch("barman.cloud.CloudBackupUploader.create_upload_controller")
+    @mock.patch("barman.cloud.CloudBackupUploader._backup_data_files")
+    @mock.patch("barman.cloud.ConcurrentBackupStrategy")
+    @mock.patch("barman.cloud.BackupInfo")
+    def test_backup_info_uploaded_with_started_before_data(
+        self,
+        mock_backup_info,
+        mock_backup_strategy,
+        _mock_backup_data_files,
+        _mock_create_upload_controller,
+    ):
+        """
+        Verify that backup.info is uploaded with status=STARTED immediately
+        after _start_backup(), before any data files are copied.
+        """
+        # GIVEN a CloudBackupUploader
+        mock_cloud_interface = MagicMock(MAX_ARCHIVE_SIZE=99999, MIN_CHUNK_SIZE=2)
+        mock_postgres = MagicMock(server_major_version=150000)
+        mock_backup_info.return_value.backup_label = None
+        mock_backup_info.return_value.backup_id = "20250101T120000"
+        uploader = CloudBackupUploader(
+            self.server_name,
+            mock_cloud_interface,
+            99999,
+            mock_postgres,
+        )
+
+        # Configure BackupInfo class-level constants to real strings so that
+        # cloud.py code such as ``BackupInfo.STARTED`` resolves correctly when
+        # the class is patched.
+        mock_backup_info.STARTED = BackupInfo.STARTED
+        mock_backup_info.DONE = BackupInfo.DONE
+
+        upload_calls = []
+
+        # Wire set_attribute to actually update the mock's attribute so that
+        # status changes made via set_attribute() are observable.
+        def fake_set_attribute(attr, value):
+            setattr(mock_backup_info.return_value, attr, value)
+
+        mock_backup_info.return_value.set_attribute.side_effect = fake_set_attribute
+
+        # Track each upload_fileobj call with the status at the time of the call
+        def record_upload(fileobj, key):
+            if "backup.info" in key:
+                upload_calls.append(mock_backup_info.return_value.status)
+
+        mock_cloud_interface.upload_fileobj.side_effect = record_upload
+
+        # WHEN backup is called
+        uploader.backup()
+
+        # THEN backup.info was uploaded at least twice
+        assert len(upload_calls) >= 2, (
+            "Expected backup.info to be uploaded at least twice "
+            "(once with STARTED, once with final status)"
+        )
+        # AND the first upload was with status STARTED
+        assert upload_calls[0] == BackupInfo.STARTED, (
+            "Expected first backup.info upload to have status STARTED, "
+            "got %s" % upload_calls[0]
+        )
+
+    @mock.patch("barman.cloud.CloudBackupUploader.create_upload_controller")
+    @mock.patch("barman.cloud.CloudBackupUploader._backup_data_files")
+    @mock.patch("barman.cloud.ConcurrentBackupStrategy")
+    @mock.patch("barman.cloud.BackupInfo")
+    def test_backup_info_uploaded_with_failed_on_error(
+        self,
+        mock_backup_info,
+        mock_backup_strategy,
+        mock_backup_data_files,
+        _mock_create_upload_controller,
+    ):
+        """
+        Verify that backup.info is uploaded with status=FAILED in the finally
+        block when an error occurs after the initial STARTED upload.
+        """
+        # GIVEN a CloudBackupUploader where _backup_data_files raises an error
+        mock_cloud_interface = MagicMock(MAX_ARCHIVE_SIZE=99999, MIN_CHUNK_SIZE=2)
+        mock_postgres = MagicMock(server_major_version=150000)
+        mock_backup_info.return_value.backup_label = None
+        mock_backup_info.return_value.backup_id = "20250101T120000"
+        uploader = CloudBackupUploader(
+            self.server_name,
+            mock_cloud_interface,
+            99999,
+            mock_postgres,
+        )
+
+        # Configure the patched BackupInfo class to use real status string constants
+        # so that cloud.py code such as ``BackupInfo.FAILED`` resolves to 'FAILED'
+        # rather than a MagicMock attribute.
+        mock_backup_info.STARTED = BackupInfo.STARTED
+        mock_backup_info.FAILED = BackupInfo.FAILED
+        mock_backup_info.DONE = BackupInfo.DONE
+
+        upload_calls = []
+
+        def mock_start_backup(backup_info):
+            backup_info.status = BackupInfo.STARTED
+
+        mock_backup_strategy.return_value.start_backup.side_effect = mock_start_backup
+        mock_backup_data_files.side_effect = Exception("upload error")
+
+        # Make set_attribute actually update the mock's attribute so that
+        # handle_backup_errors(…, FAILED) is reflected when the finally block
+        # calls _upload_backup_info().
+        def mock_set_attribute(name, value):
+            setattr(mock_backup_info.return_value, name, value)
+
+        mock_backup_info.return_value.set_attribute.side_effect = mock_set_attribute
+
+        def record_upload(fileobj, key):
+            if "backup.info" in key:
+                upload_calls.append(mock_backup_info.return_value.status)
+
+        mock_cloud_interface.upload_fileobj.side_effect = record_upload
+
+        # WHEN backup is called, it raises SystemExit due to the error
+        with pytest.raises(SystemExit):
+            uploader.backup()
+
+        # THEN backup.info was uploaded at least twice
+        assert len(upload_calls) >= 2
+        # AND the first upload had status STARTED
+        assert upload_calls[0] == BackupInfo.STARTED
+        # AND the final upload had status FAILED
+        assert upload_calls[-1] == BackupInfo.FAILED
+
+
+class TestGetBackupIdUsingShortcutSkipsStarted(object):
+    """Tests that _get_backup_id_using_shortcut skips STARTED backups."""
+
+    def _make_catalog(self, backups_by_id):
+        """Return a CloudBackupCatalog with a mocked get_backup_list."""
+        catalog = CloudBackupCatalog(MagicMock(), "test-server")
+        catalog.get_backup_list = lambda: backups_by_id
+        return catalog
+
+    def _backup(self, status):
+        b = MagicMock()
+        b.status = status
+        return b
+
+    def test_last_skips_started_backup(self):
+        """last/latest must skip in-progress backups and return latest DONE."""
+        backups = {
+            "20250101T100000": self._backup(BackupInfo.DONE),
+            "20250101T110000": self._backup(BackupInfo.DONE),
+            "20250101T120000": self._backup(BackupInfo.STARTED),
+        }
+        catalog = self._make_catalog(backups)
+        assert catalog._get_backup_id_using_shortcut("last") == "20250101T110000"
+        assert catalog._get_backup_id_using_shortcut("latest") == "20250101T110000"
+
+    def test_first_skips_started_backup(self):
+        """first/oldest must skip in-progress backups and return oldest DONE."""
+        backups = {
+            "20250101T100000": self._backup(BackupInfo.STARTED),
+            "20250101T110000": self._backup(BackupInfo.DONE),
+            "20250101T120000": self._backup(BackupInfo.DONE),
+        }
+        catalog = self._make_catalog(backups)
+        assert catalog._get_backup_id_using_shortcut("first") == "20250101T110000"
+        assert catalog._get_backup_id_using_shortcut("oldest") == "20250101T110000"
+
+    def test_last_returns_none_when_all_started(self):
+        """last/latest returns None if all backups are STARTED."""
+        backups = {
+            "20250101T100000": self._backup(BackupInfo.STARTED),
+            "20250101T110000": self._backup(BackupInfo.STARTED),
+        }
+        catalog = self._make_catalog(backups)
+        assert catalog._get_backup_id_using_shortcut("last") is None
+        assert catalog._get_backup_id_using_shortcut("latest") is None
+
+    def test_first_returns_none_when_all_started(self):
+        """first/oldest returns None if all backups are STARTED."""
+        backups = {
+            "20250101T100000": self._backup(BackupInfo.STARTED),
+        }
+        catalog = self._make_catalog(backups)
+        assert catalog._get_backup_id_using_shortcut("first") is None
+        assert catalog._get_backup_id_using_shortcut("oldest") is None
+
+    def test_last_failed_not_affected_by_started_filter(self):
+        """last-failed continues to return the most recent FAILED backup."""
+        backups = {
+            "20250101T100000": self._backup(BackupInfo.FAILED),
+            "20250101T110000": self._backup(BackupInfo.STARTED),
+        }
+        catalog = self._make_catalog(backups)
+        assert catalog._get_backup_id_using_shortcut("last-failed") == "20250101T100000"
