@@ -1,6 +1,6 @@
-# Drop-in replacement for ghcr.io/cloudnative-pg/plugin-barman-cloud-sidecar:v0.13.0
+# Drop-in replacement for ghcr.io/cloudnative-pg/plugin-barman-cloud-sidecar:v0.14.0
 # with patched barman 3.19.1 (PR #1161 — R2 multipart-uniform parts) installed
-# in place of the bundled 3.19.1.
+# in place of the bundled (unpatched) 3.19.1.
 #
 # The sidecar's Go binary `/manager` (cnpg-i gRPC server) is preserved as-is;
 # only the Python `barman` package under
@@ -12,7 +12,7 @@
 # barman 3.19.1 with the builder's pip and copy only the package directory
 # back over the upstream image.
 
-ARG SIDECAR_BASE=ghcr.io/cloudnative-pg/plugin-barman-cloud-sidecar:v0.13.0
+ARG SIDECAR_BASE=ghcr.io/cloudnative-pg/plugin-barman-cloud-sidecar:v0.14.0
 
 FROM python:3.13-slim AS builder
 

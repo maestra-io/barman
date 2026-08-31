@@ -18,10 +18,15 @@ overshoot in the buffer for the next part. See `barman/cloud.py` `_write_data` /
 
 ## Branches
 
-- `release/3.18.0` — pristine upstream tag, used as the rebase base.
-- `main` — `release/3.18.0` + the two fix commits cherry-picked from PR #1161.
+- `release/3.19.1` — pristine upstream **tag**, used as the rebase base.
+- `main` — `release/3.19.1` + the two fix commits cherry-picked from PR #1161,
+  plus the maestra-only build files (`Dockerfile`, `Dockerfile.sidecar`,
+  `.github/workflows/release.yml`, this file).
 
-When upstream tags 3.19+ with the fix merged, retire this fork.
+Retire this fork once [PR #1161](https://github.com/EnterpriseDB/barman/pull/1161)
+is merged AND released upstream AND the cnpg sidecar image rebuilds against that
+release. As of 2026-08-31 the PR is still open, so 3.19.1 and 3.20.0 do not carry
+the fix and the overlay is still required.
 
 ## Images
 
@@ -31,7 +36,7 @@ every `v*` tag, and pushes both to public ECR:
 | repo | dockerfile | purpose |
 |---|---|---|
 | `public.ecr.aws/g5f9s8a4/barman` | `Dockerfile` | Standalone `barman-cloud-*` CLI (python:3.13-slim + snappy + lz4 + boto3). Reference / debug aid. |
-| `public.ecr.aws/g5f9s8a4/plugin-barman-cloud-sidecar` | `Dockerfile.sidecar` | Drop-in replacement for `ghcr.io/cloudnative-pg/plugin-barman-cloud-sidecar:v0.11.0`. Same Go `/manager` binary, but `/venv/lib/python3.13/site-packages/barman` replaced with patched 3.18.0. This is the one omicron's `plugin-barman-cloud-config.SIDECAR_IMAGE` points at. |
+| `public.ecr.aws/g5f9s8a4/plugin-barman-cloud-sidecar` | `Dockerfile.sidecar` | Drop-in replacement for `ghcr.io/cloudnative-pg/plugin-barman-cloud-sidecar:v0.14.0` (`ARG SIDECAR_BASE`). Same Go `/manager` binary, but `/venv/lib/python3.13/site-packages/barman` replaced with patched 3.19.1. This is the one us-omega's and us-omicron's `sidecarImage` in `maestra-io/fluxcd` `base/cnpg-plugin-barman-cloud` points at. |
 
 Tags emitted (per `docker/metadata-action`):
 - `latest` (default branch only)
