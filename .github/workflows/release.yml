@@ -23,7 +23,7 @@ env:
 jobs:
   image:
     name: Build & push images to public ECR
-    runs-on: ubuntu-latest
+    runs-on: runs-on=${{ github.run_id }}/pool=build
     strategy:
       fail-fast: false
       matrix:
@@ -37,6 +37,7 @@ jobs:
           - name: plugin-barman-cloud-sidecar
             dockerfile: Dockerfile.sidecar
     steps:
+      - uses: runs-on/action@v2
       - uses: actions/checkout@v6
 
       - name: Get Teleport version
