@@ -23,7 +23,7 @@ env:
 jobs:
   image:
     name: Build & push images to public ECR
-    runs-on: runs-on=${{ github.run_id }}/pool=build
+    runs-on: runs-on=${{ github.run_id }}-image-${{ strategy.job-index }}/pool=build
     strategy:
       fail-fast: false
       matrix:
